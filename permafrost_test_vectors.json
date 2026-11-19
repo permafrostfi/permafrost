@@ -1,0 +1,492 @@
+[
+  {
+    "case": "V1 \u2014 seed the empty vault",
+    "given": {
+      "usd": 25,
+      "split": "equal by dollars ($6.25 a leg)",
+      "prices_t0": [
+        220000000,
+        340000000,
+        510000000,
+        575000000
+      ],
+      "initial_units": 25000000000
+    },
+    "expect": {
+      "holdings": [
+        2840909,
+        1838235,
+        1225490,
+        1086956
+      ],
+      "supply": 25000000000,
+      "dead_units": 25000000000,
+      "unit_value_usdc": 0.99999976,
+      "note": "seed units go to an UNSPENDABLE ADDRESS; supply must never be 0"
+    }
+  },
+  {
+    "case": "V2 \u2014 deposit $2,000 in exact ratio, 0 bp entry fee",
+    "given": {
+      "holdings_before": [
+        195863813,
+        126735392,
+        84490261,
+        74939164
+      ],
+      "delivered": [
+        193022905,
+        124897158,
+        83264772,
+        73852209
+      ],
+      "entry_bp": 0
+    },
+    "expect": {
+      "units_to_depositor": 1698601599328,
+      "units_to_creator": 0,
+      "refunds": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "supply": 1723601599328,
+      "unit_value_before_usdc": 1.17743912,
+      "unit_value_after_usdc": 1.177439123,
+      "invariant": "unit value must be IDENTICAL before and after"
+    }
+  },
+  {
+    "case": "V3 \u2014 deposit with two over-delivered legs; mint on the smallest ratio",
+    "given": {
+      "holdings_before": [
+        195863813,
+        126735392,
+        84490261,
+        74939164
+      ],
+      "delivered": [
+        42429905,
+        30200105,
+        18303093,
+        16721064
+      ],
+      "entry_bp": 0
+    },
+    "expect": {
+      "units_to_depositor": 373383136357,
+      "refunds": [
+        2,
+        2745466,
+        1,
+        487022
+      ],
+      "note": "refund is non-zero only on the over-delivered legs",
+      "supply": 2096984735685
+    }
+  },
+  {
+    "case": "V4 \u2014 dust deposit of 1 base unit per leg must be REJECTED",
+    "given": {
+      "holdings_before": [
+        238293716,
+        154190031,
+        102793353,
+        91173206
+      ],
+      "delivered": [
+        1,
+        1,
+        1,
+        1
+      ]
+    },
+    "expect": {
+      "result": "rejected: deposit too small to mint a unit; nothing retained",
+      "why": "flooring `required` drives every leg to 0 while k stays positive. Deriving gross from k would mint ~8,800 base units against nothing retained. gross MUST be recomputed from the retained amounts."
+    }
+  },
+  {
+    "case": "V5 \u2014 deposit $1,000 with the entry fee at its 100 bp cap",
+    "given": {
+      "holdings_before": [
+        238293716,
+        154190031,
+        102793353,
+        91173206
+      ],
+      "delivered": [
+        90311370,
+        58436761,
+        38957840,
+        34553899
+      ],
+      "entry_bp": 100
+    },
+    "expect": {
+      "units_to_depositor": 786792631793,
+      "units_to_creator": 7947400321,
+      "check": "to_depositor + to_creator == gross",
+      "gross": 794740032114,
+      "creator_share_bp": 99
+    }
+  },
+  {
+    "case": "V6 \u2014 redeem half of the V2 depositor's units, 0 bp exit fee",
+    "given": {
+      "holdings_before": [
+        328605084,
+        212626791,
+        141751192,
+        125727104
+      ],
+      "supply_before": 2891724767799,
+      "units_in": 849300799664,
+      "exit_bp": 0
+    },
+    "expect": {
+      "payouts": [
+        96511453,
+        62448579,
+        41632385,
+        36926104
+      ],
+      "units_burned": 849300799664,
+      "units_to_creator": 0,
+      "supply_after": 2042423968135,
+      "invariant": "payout_i == holdings_i * burned / supply_before, floored"
+    }
+  },
+  {
+    "case": "V7 \u2014 redeem with the exit fee at its 100 bp cap",
+    "given": {
+      "holdings_before": [
+        232093631,
+        150178212,
+        100118807,
+        88801000
+      ],
+      "supply_before": 2042423968135,
+      "units_in": 424650399832,
+      "exit_bp": 100
+    },
+    "expect": {
+      "payouts": [
+        47773169,
+        30912046,
+        20608031,
+        18278421
+      ],
+      "units_burned": 420403895834,
+      "units_to_creator": 4246503998,
+      "note": "fee units are TRANSFERRED to the creator, not burned; the payout is computed on the burnt amount only"
+    }
+  },
+  {
+    "case": "V8 \u2014 streaming fee at 100 bp/yr accrued over exactly one year",
+    "given": {
+      "supply_before": 1622020072301,
+      "stream_bp": 100,
+      "elapsed_seconds": 31536000
+    },
+    "expect": {
+      "units_minted": 16384041134,
+      "supply_after": 1638404113435,
+      "creator_share_bp": 99,
+      "invariant": "minted/(supply_before+minted) == 100bp, floored"
+    }
+  },
+  {
+    "case": "V9 \u2014 rebalance check with no leg above 50%",
+    "given": {
+      "holdings": [
+        184320462,
+        119266166,
+        79510776,
+        70522579
+      ],
+      "prices": [
+        340000000,
+        400000000,
+        580000000,
+        675000000
+      ]
+    },
+    "expect": {
+      "weights_bp": [
+        3070,
+        2337,
+        2259,
+        2332
+      ],
+      "plan": null,
+      "note": "observe() must record no candidate"
+    }
+  },
+  {
+    "case": "V10 \u2014 rebalance from 55/20/15/10, equal thirds, cap does not bind",
+    "given": {
+      "weights_before_bp": [
+        5500,
+        2000,
+        1499,
+        999
+      ],
+      "total_value_usdc": 999999985900
+    },
+    "expect": {
+      "leg": "NVDAx",
+      "sell_value_usdc": 250000001230,
+      "alloc_value_usdc": {
+        "GOOGLx": 83333333743,
+        "MSFTx": 83333333743,
+        "METAx": 83333333744
+      },
+      "capped": false,
+      "weights_after_bp": [
+        3000,
+        2833,
+        2333,
+        1833
+      ],
+      "note": "equal thirds pushes the smallest laggard up the most"
+    }
+  },
+  {
+    "case": "V11 \u2014 rebalance from 50.5/44.5/3/2, the 40% recipient cap binds",
+    "given": {
+      "weights_before_bp": [
+        5050,
+        4450,
+        299,
+        199
+      ],
+      "total_value_usdc": 999999986300
+    },
+    "expect": {
+      "leg": "NVDAx",
+      "sell_value_usdc": 205000001510,
+      "alloc_value_usdc": {
+        "GOOGLx": 0,
+        "MSFTx": 102500000755,
+        "METAx": 102500000755
+      },
+      "capped": false,
+      "weights_after_bp": [
+        3000,
+        4450,
+        1324,
+        1224
+      ],
+      "note": "without the cap Alphabet would land above 50% and immediately re-breach the trigger, then sit there for 180 days"
+    }
+  },
+  {
+    "case": "V13 \u2014 decay schedule on the V10 auction (per 1 whole NVDAx)",
+    "given": {
+      "buy_ratio_fair": [
+        0,
+        28333333,
+        19540229,
+        16790123
+      ],
+      "start_bp": 25,
+      "floor_bp": -150,
+      "decay_seconds": 21600
+    },
+    "expect": {
+      "schedule": [
+        {
+          "hours": 0,
+          "margin_bp": 25,
+          "offered_ratio": [
+            0,
+            28404167,
+            19589080,
+            16832099
+          ]
+        },
+        {
+          "hours": 1,
+          "margin_bp": -4,
+          "offered_ratio": [
+            0,
+            28322000,
+            19532413,
+            16783407
+          ]
+        },
+        {
+          "hours": 3,
+          "margin_bp": -62,
+          "offered_ratio": [
+            0,
+            28157667,
+            19419080,
+            16686025
+          ]
+        },
+        {
+          "hours": 6,
+          "margin_bp": -150,
+          "offered_ratio": [
+            0,
+            27908334,
+            19247126,
+            16538272
+          ]
+        },
+        {
+          "hours": 24,
+          "margin_bp": -150,
+          "offered_ratio": [
+            0,
+            27908334,
+            19247126,
+            16538272
+          ]
+        },
+        {
+          "hours": 72,
+          "margin_bp": -150,
+          "offered_ratio": [
+            0,
+            27908334,
+            19247126,
+            16538272
+          ]
+        }
+      ],
+      "note": "margin runs +25bp -> -150bp linearly over 6h, then flat. Ratios round UP: they are what ENTERS the vault."
+    }
+  },
+  {
+    "case": "V14 \u2014 a 10% partial fill, at open and at the floor",
+    "given": {
+      "sell_amount_tokens": 7352941212,
+      "buy_ratio_fair": [
+        0,
+        28333333,
+        19540229,
+        16790123
+      ]
+    },
+    "expect": {
+      "required_at_t0": [
+        0,
+        2088541702,
+        1440373537,
+        1237654345
+      ],
+      "required_at_floor": [
+        0,
+        2052083393,
+        1415229860,
+        1216049418
+      ],
+      "delta_bp": 175,
+      "note": "fill() reads no oracle; only elapsed time. Required amounts use ceiling division so the vault never rounds against itself."
+    }
+  },
+  {
+    "case": "V12 \u2014 Pyth exponent normalisation to USDC base units",
+    "given": {
+      "rule": "usdc = price * 10**(expo + 6); expo is READ from the feed, never assumed",
+      "cases": 5
+    },
+    "expect": {
+      "table": [
+        {
+          "pyth_price": 22043750000,
+          "expo": -8,
+          "usdc_floor": 220437500,
+          "usdc_ceil": 220437500,
+          "human": "$220.437500"
+        },
+        {
+          "pyth_price": 34055000000,
+          "expo": -8,
+          "usdc_floor": 340550000,
+          "usdc_ceil": 340550000,
+          "human": "$340.550000"
+        },
+        {
+          "pyth_price": 50999000,
+          "expo": -5,
+          "usdc_floor": 509990000,
+          "usdc_ceil": 509990000,
+          "human": "$509.990000"
+        },
+        {
+          "pyth_price": 57443123456,
+          "expo": -9,
+          "usdc_floor": 57443123,
+          "usdc_ceil": 57443124,
+          "human": "$57.443123"
+        },
+        {
+          "pyth_price": 340550000,
+          "expo": -6,
+          "usdc_floor": 340550000,
+          "usdc_ceil": 340550000,
+          "human": "$340.550000"
+        }
+      ],
+      "note": "expo -8 is typical for US equities today but MUST NOT be hard-coded. A one-place error here is unfixable after deployment."
+    }
+  },
+  {
+    "case": "V12b \u2014 conservative pricing, candidate leg = NVDAx (index 0)",
+    "given": {
+      "feeds_price_conf_expo": [
+        [
+          22043750000,
+          5000000,
+          -8
+        ],
+        [
+          34055000000,
+          8000000,
+          -8
+        ],
+        [
+          50999000000,
+          12000000,
+          -8
+        ],
+        [
+          57443000000,
+          14000000,
+          -8
+        ]
+      ],
+      "candidate_leg": 0
+    },
+    "expect": {
+      "prices_usdc": [
+        220387500,
+        340630000,
+        510110000,
+        574570000
+      ],
+      "note": "candidate uses (price - conf) rounded DOWN; others use (price + conf) rounded UP. Both make the trigger harder to hit."
+    }
+  },
+  {
+    "case": "V12c \u2014 the confirmed mainnet feed IDs",
+    "given": {
+      "source": "hermes.pyth.network/v2/price_feeds, 4 Sep 2026",
+      "symbol_pattern": "Equity.US.<TICKER>/USD (regular session)"
+    },
+    "expect": {
+      "feeds": {
+        "NVDAx": "b1073854ed24cbc755dc527418f52b7d271f6cc967bbf8d8129112b18860a593",
+        "GOOGLx": "5a48c03e9b9cb337801073ed9d166817473697efff0d138874e0f6a33d6d5aa6",
+        "MSFTx": "d0ca23c1cc005e004ccf1db5bf76aeb6a49218f43dac3d4b275e92de12ded4d1",
+        "METAx": "78a3e3b8e676a8f73c439f5d749737034b139bbbe899ba5775216fba596607fe"
+      },
+      "schedule": "America/New_York;0930-1600 x5;C,C \u2014 closed at weekends, which is what enforces weekday-only rebalancing"
+    }
+  }
+]

@@ -1,0 +1,9 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 14cbafc49607a795b45553adf0bb3d45a60d67216c9477baf062aa5e1bd4984a # shrinks to v0 = Vault { holdings: [832670290453, 402608856493, 310870847272, 298801296472], supply: 681416686683, entry_bp: 86, exit_bp: 0, stream_bp: 0, last_accrual: 0, creator_units: 0, dead_units: 681416686683 }, num = 354065, j = [6017, 6018, 6018, 6018]
+cc 7dc6536787a9c043d1e2c3e7270490ca86001bda33f1cff4888067ffdd20e85b # shrinks to v0 = Vault { holdings: [1, 1, 1, 233500444258], supply: 265251385965, entry_bp: 0, exit_bp: 4, stream_bp: 0, last_accrual: 0, creator_units: 0, dead_units: 265251385965 }, frac = 7129
+cc 7ffe2f42a9536ac5591fe228cbdd2c5f632abe100c2c74a3bc11d9674a22afc8 # shrinks to h = [50087128252, 1, 53382064389, 11433660910], prices = [1, 389850720, 283590675, 1], elapsed = 21600, frac = 86

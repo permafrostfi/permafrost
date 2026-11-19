@@ -1,0 +1,24 @@
+campaign: 40 shards x 250000 scenarios = 10000000 total
+Tue Sep  8 02:56:00 UTC 2026
+
+================ CAMPAIGN SUMMARY ================
+scenarios          : 10,000,000
+operations         : 78,538,573
+    acc      5,359,221   rejected by both:          0 ( 0.0%)
+    auc      5,357,851   rejected by both:        196 ( 0.0%)
+    clm        814,887   rejected by both:    406,380 (49.9%)
+    dep     10,716,378   rejected by both:  2,723,532 (25.4%)
+    depd     5,354,704   rejected by both:  1,362,303 (25.4%)
+    depl    10,711,656   rejected by both:  2,723,867 (25.4%)
+    dial    10,713,334   rejected by both:  2,248,552 (21.0%)
+    exl        812,718   rejected by both:    407,784 (50.2%)
+    fund     5,352,746   rejected by both:    826,291 (15.4%)
+    pyth    10,000,000   rejected by both:          0 ( 0.0%)
+    reb      5,354,083   rejected by both:          9 ( 0.0%)
+    red      2,633,483   rejected by both:          0 ( 0.0%)
+    wd       5,357,512   rejected by both:  1,703,171 (31.8%)
+invariant failures : 0
+MISMATCHES         : 0
+
+RESULT: PASS — the Rust core and the Python reference are bit-identical
+Tue Sep  8 03:08:04 UTC 2026

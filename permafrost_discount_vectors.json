@@ -1,0 +1,187 @@
+[
+  {
+    "case": "D0 \u2014 the shared starting state",
+    "given": {
+      "seed_usd": 25,
+      "prices": [
+        220000000,
+        340000000,
+        510000000,
+        575000000
+      ],
+      "initial_units": 25000000000,
+      "entry_bp": 30,
+      "then": "one ordinary $2,000 deposit"
+    },
+    "expect": {
+      "holdings": [
+        230113681,
+        148897068,
+        99264712,
+        88043455
+      ],
+      "supply": 2025000437000,
+      "creator_units": 6000001311,
+      "note": "every case below forks from exactly this vault"
+    }
+  },
+  {
+    "case": "D1 \u2014 liquid discounted deposit, the RATE is the binding ceiling",
+    "given": {
+      "delivered": [
+        113636384,
+        73529415,
+        49019610,
+        43478248
+      ],
+      "discount_bp": 50,
+      "max_bonus_units": 10000000000,
+      "subsidy_units_before": 100000000000,
+      "entry_bp": 30
+    },
+    "expect": {
+      "minted_to_depositor": 997000160517,
+      "bonus": 4985000802,
+      "to_depositor_total": 1001985161319,
+      "to_creator": 3000000482,
+      "refunds": [
+        2,
+        2,
+        1,
+        1
+      ],
+      "subsidy_units_after": 95014999198,
+      "supply": 3025000597999,
+      "note": "bonus == minted * 50 / 10000, floored; supply unchanged by the bonus"
+    }
+  },
+  {
+    "case": "D2 \u2014 locked deposit held to MATURITY",
+    "given": {
+      "delivered": [
+        22727276,
+        14705883,
+        9803922,
+        8695649
+      ],
+      "locked_discount_bp": 2500,
+      "max_bonus_units": 1000000000000,
+      "subsidy_units_before": 100000000000,
+      "deposited_at": 1767225600,
+      "claimed_at": 1777593600
+    },
+    "expect": {
+      "position_id": 1,
+      "principal": 199400000000,
+      "bonus": 49850000000,
+      "unlock_at": 1777593600,
+      "escrow_after_open": 249250000000,
+      "claimed": 249250000000,
+      "escrow_after_claim": 0,
+      "subsidy_units_after": 50150000000,
+      "open_positions": 0,
+      "note": "claim pays principal + bonus; the pool does NOT get the bonus back"
+    }
+  },
+  {
+    "case": "D3 \u2014 locked deposit exited EARLY, one second before maturity",
+    "given": {
+      "delivered": [
+        22727276,
+        14705883,
+        9803922,
+        8695649
+      ],
+      "locked_discount_bp": 2500,
+      "subsidy_units_before": 100000000000,
+      "deposited_at": 1767225600,
+      "exited_at": 1777593599
+    },
+    "expect": {
+      "principal": 199400000000,
+      "bonus": 49850000000,
+      "subsidy_units_after_open": 50150000000,
+      "returned_to_depositor": 199400000000,
+      "subsidy_units_after_exit": 100000000000,
+      "escrow_after_exit": 0,
+      "open_positions": 0,
+      "note": "principal back IN FULL, bonus back to the pool, no penalty"
+    }
+  },
+  {
+    "case": "D4 \u2014 the POOL runs dry mid-deposit",
+    "given": {
+      "subsidy_units_before": 3000000000,
+      "locked_discount_bp": 10000,
+      "max_bonus_units": 1000000000000,
+      "delivered": [
+        22727276,
+        14705883,
+        9803922,
+        8695649
+      ],
+      "note_given": "the rate alone would pay ~199 units; the pool holds 3"
+    },
+    "expect": {
+      "first_principal": 199400000000,
+      "first_bonus": 3000000000,
+      "subsidy_units_after_first": 0,
+      "second_principal": 199400000000,
+      "second_bonus": 0,
+      "subsidy_units_after_second": 0,
+      "escrow_units": 401800000000,
+      "open_positions": 2,
+      "note": "the pool is the binding ceiling; the next deposit still works, it just pays nothing"
+    }
+  },
+  {
+    "case": "D5 \u2014 the per-deposit CAP binds",
+    "given": {
+      "subsidy_units_before": 100000000000,
+      "locked_discount_bp": 10000,
+      "max_bonus_units": 7000000000,
+      "delivered": [
+        22727276,
+        14705883,
+        9803922,
+        8695649
+      ]
+    },
+    "expect": {
+      "principal": 199400000000,
+      "bonus": 7000000000,
+      "subsidy_units_after": 93000000000,
+      "escrow_units": 206400000000,
+      "note": "without the cap this one deposit would have taken all 100 units"
+    }
+  },
+  {
+    "case": "D6 \u2014 the DIALS MOVE while a position is open",
+    "given": {
+      "locked_discount_bp_at_open": 5000,
+      "delivered": [
+        22727276,
+        14705883,
+        9803922,
+        8695649
+      ],
+      "then": "discount_on=False and set_discount(0, 0, 0)",
+      "exited_at": 1767225601
+    },
+    "expect": {
+      "principal": 199400000000,
+      "bonus": 99700000000,
+      "escrow_at_open": 299100000000,
+      "escrow_after_dials": 299100000000,
+      "position_after_dials": [
+        199400000000,
+        99700000000,
+        1777593600
+      ],
+      "returned_to_depositor": 199400000000,
+      "subsidy_units_at_open": 300000000,
+      "subsidy_units_after_exit": 100000000000,
+      "note": "changing a dial never reaches an open position; the early exit still returns the principal in full"
+    }
+  }
+]
