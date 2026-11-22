@@ -1,0 +1,25 @@
+[package]
+name = "permafrost"
+version = "0.1.0"
+description = "Permafrost v1 vault: seed / deposit / redeem / set_cap"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "permafrost"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+# Pinned exactly: cargo resolved ^0.31.1 to 0.31.3 unasked. A program that holds
+# money is built from versions chosen on purpose, not whatever is newest today.
+anchor-lang = "=0.31.3"
+anchor-spl = { version = "=0.31.3", default-features = false, features = ["token", "mint", "token_2022", "token_2022_extensions", "associated_token"] }
+# All arithmetic lives here and is differential-tested against the Python reference.
+permafrost-core = { path = "../../../permafrost-core" }
