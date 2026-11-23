@@ -111,11 +111,24 @@ VAULT_LEGS = [ata(VAULT, m) for m in LEG_MINTS]
 DEAD_OWNER = pda([b"dead"])
 DEAD_UNITS = ata(DEAD_OWNER, UNIT_MINT)
 
+# v2 — locked bonus
+POOL = pda([b"pool"])
+ESCROW = pda([b"escrow"])
+DAY = 86_400
+
+
+def position_pda(pid: int) -> Pubkey:
+    return pda([b"position", struct.pack("<Q", pid)])
+
 # Anchor error codes for this program (declaration order in PfErr, from 6000).
 ERR = {n: 6000 + i for i, n in enumerate([
     "Unauthorized", "AlreadySeeded", "CapExceeded", "SlippageUnits", "SlippageLeg",
     "BadAccount", "MetadataTooLong", "Overflow", "UnexpectedFee", "CoreUnseeded",
     "CoreEmptyLeg", "CoreDust", "CoreBadRedeem", "CoreBadSeed", "CoreArithmetic",
+    # v2
+    "DiscountsNotReady", "DiscountsOff", "RateTooHigh", "LockOutOfRange",
+    "LockLongerThanAccepted", "BonusBelowAccepted", "ZeroAmount", "BadAmount",
+    "NotMatured", "AlreadyMatured", "NotPositionOwner",
 ])}
 
 
@@ -380,6 +393,127 @@ class World:
         metas[0] = AccountMeta(admin.pubkey(), True, False)
         data = anchor_disc("set_cap") + struct.pack("<Q", new_cap)
         return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    # ------------------------------------------------- v2: locked bonus
+    def vault_v2(self) -> dict:
+        d = self.account_data(VAULT)
+        o = 8 + 3 + 8
+        ready, on, bp, days, mx, nxt = struct.unpack_from("<??HHQQ", d, o)
+        return dict(ready=ready, on=on, locked_bp=bp, lock_days=days, max_bonus=mx, next_position=nxt)
+
+    def position(self, pid: int):
+        d = self.account_data(position_pda(pid))
+        if d is None:
+            return None
+        pid_, owner, principal, bonus, opened, unlock = struct.unpack_from("<Q32sQQqq", d, 8)
+        return dict(id=pid_, owner=Pubkey(owner), principal=principal, bonus=bonus,
+                    opened_at=opened, unlock_at=unlock)
+
+    def now(self) -> int:
+        return self.svm.get_clock().unix_timestamp
+
+    def warp(self, seconds: int):
+        c = self.svm.get_clock()
+        c.unix_timestamp = c.unix_timestamp + seconds
+        c.slot = c.slot + max(1, seconds // 1)
+        self.svm.set_clock(c)
+        self.svm.expire_blockhash()
+
+    def ix_init_discounts(self, admin: Keypair, override=None) -> Instruction:
+        metas = self.admin_metas(admin.pubkey()) + [
+            AccountMeta(VAULT, False, True),
+            AccountMeta(UNIT_MINT, False, False),
+            AccountMeta(POOL, False, True),
+            AccountMeta(ESCROW, False, True),
+            AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(SYSTEM, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc("init_discounts"), _apply(metas, override))
+
+    def ix_set_discount(self, admin: Keypair, on=True, locked_bp=1000, max_bonus=10 * UNIT,
+                        lock_days=120, override=None) -> Instruction:
+        metas = self.admin_metas(admin.pubkey()) + [AccountMeta(VAULT, False, True)]
+        metas[0] = AccountMeta(admin.pubkey(), True, False)
+        data = anchor_disc("set_discount") + struct.pack("<?HQH", on, locked_bp, max_bonus, lock_days)
+        return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    def ix_fund_pool(self, funder: Keypair, amount: int, src=None, override=None) -> Instruction:
+        metas = [
+            AccountMeta(funder.pubkey(), True, False),
+            AccountMeta(VAULT, False, False),
+            AccountMeta(UNIT_MINT, False, False),
+            AccountMeta(src or ata(funder.pubkey(), UNIT_MINT), False, True),
+            AccountMeta(POOL, False, True),
+            AccountMeta(TOKEN_2022, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc("fund_pool") + struct.pack("<Q", amount), _apply(metas, override))
+
+    def ix_withdraw_pool(self, admin: Keypair, amount: int, destination: Pubkey, override=None) -> Instruction:
+        metas = self.admin_metas(admin.pubkey()) + [
+            AccountMeta(VAULT, False, False),
+            AccountMeta(UNIT_MINT, False, False),
+            AccountMeta(POOL, False, True),
+            AccountMeta(destination, False, True),
+            AccountMeta(TOKEN_2022, False, False),
+        ]
+        metas[0] = AccountMeta(admin.pubkey(), True, False)
+        return Instruction(PROGRAM_ID, anchor_disc("withdraw_pool") + struct.pack("<Q", amount), _apply(metas, override))
+
+    def ix_deposit_locked(self, user: Keypair, max_in, min_units_out=0, max_lock_days=365,
+                          min_bonus=0, pid=None, override=None) -> Instruction:
+        pid = self.vault_v2()["next_position"] if pid is None else pid
+        u = user.pubkey()
+        metas = [
+            AccountMeta(u, True, True),
+            AccountMeta(VAULT, False, True),
+            AccountMeta(UNIT_MINT, False, True),
+            AccountMeta(POOL, False, True),
+            AccountMeta(ESCROW, False, True),
+            AccountMeta(position_pda(pid), False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(v, False, True) for v in VAULT_LEGS],
+            *[AccountMeta(ata(u, m), False, True) for m in LEG_MINTS],
+            AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(SYSTEM, False, False),
+        ]
+        data = anchor_disc("deposit_locked") + struct.pack("<4QQHQ", *max_in, min_units_out, max_lock_days, min_bonus)
+        return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    def _settle(self, name, owner: Keypair, pid: int, dest=None, override=None) -> Instruction:
+        o = owner.pubkey()
+        metas = [
+            AccountMeta(o, True, True),
+            AccountMeta(VAULT, False, False),
+            AccountMeta(UNIT_MINT, False, False),
+            AccountMeta(POOL, False, True),
+            AccountMeta(ESCROW, False, True),
+            AccountMeta(position_pda(pid), False, True),
+            AccountMeta(dest or ata(o, UNIT_MINT), False, True),
+            AccountMeta(TOKEN_2022, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc(name), _apply(metas, override))
+
+    def ix_claim_locked(self, owner, pid, dest=None, override=None):
+        return self._settle("claim_locked", owner, pid, dest, override)
+
+    def ix_exit_locked(self, owner, pid, dest=None, override=None):
+        return self._settle("exit_locked", owner, pid, dest, override)
+
+    def enable_discounts(self, locked_bp=1000, max_bonus=10 * UNIT, lock_days=120, fund_units=0):
+        r = self.send([self.ix_init_discounts(ADMIN)], [ADMIN])
+        assert r.ok, "init_discounts: " + r.reason()
+        r = self.send([self.ix_set_discount(ADMIN, True, locked_bp, max_bonus, lock_days)], [ADMIN])
+        assert r.ok, "set_discount: " + r.reason()
+        if fund_units:
+            # The creator gets units the ordinary way, then parks them in the pool.
+            amts = [x * 40 for x in SEED_AMOUNTS]
+            self.mint_legs(ADMIN, amts)
+            self.ensure_unit_ata(ADMIN)
+            r = self.send([self.ix_deposit(ADMIN, amts)], [ADMIN])
+            assert r.ok, "creator deposit: " + r.reason()
+            r = self.send([self.ix_fund_pool(ADMIN, fund_units)], [ADMIN])
+            assert r.ok, "fund_pool: " + r.reason()
+        return self
 
     # ------------------------------------------------------------ fixtures
     def launch(self, seed_amounts=None, cap=CAP_50K):
