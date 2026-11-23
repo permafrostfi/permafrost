@@ -29,11 +29,25 @@ declare_id!("48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2");
 /// L2 — the basket, hard-coded and in this order. Never configurable at set-up,
 /// so set-up cannot be got wrong and no look-alike token can be slipped in.
 /// Changing the basket means a new vault (decision D6).
+#[cfg(not(feature = "devnet"))]
 pub const LEG_MINTS: [Pubkey; 4] = [
     pubkey!("Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh"), // NVDAx
     pubkey!("XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN"), // GOOGLx
     pubkey!("XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX"), // MSFTx
     pubkey!("Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu"), // METAx
+];
+
+/// DEVNET BUILD ONLY (`--features devnet`): replicas of the four mints, created on
+/// devnet by tests/devnet.py with the same extension set as the real ones
+/// (tests/replica.py). A mainnet binary must never be built with this feature —
+/// the launch checklist verifies the deployed binary's hash against a build
+/// without it.
+#[cfg(feature = "devnet")]
+pub const LEG_MINTS: [Pubkey; 4] = [
+    pubkey!("A15QnvzoNKst2X2aVaQANvr48kzKVRyYHzP6DXHjppFz"), // NVDAx replica
+    pubkey!("5dy1EDc71EC9tsJzbbY78ZTh1vdhGMeXQNyPiUKtpGzn"), // GOOGLx replica
+    pubkey!("JCs5xPjRmSBHtYKAWB6PviCAE5TUMPV4UibbKkPpRMGP"), // MSFTx replica
+    pubkey!("DRcvvyhjF7chPrLbUyoX8DG67j1HYix2WKkHEaHUHHB9"), // METAx replica
 ];
 
 /// L3 — the Permafrost unit has 9 decimals.

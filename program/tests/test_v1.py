@@ -532,8 +532,12 @@ def E5_dividend_multiplier_changes_nothing_in_deposit_or_redeem():
     """The D2 argument, tested: a per-leg multiplier cancels out of every ratio
     deposit and redeem compute, because they read raw amounts."""
     results = []
+    start = None
     for mult in (None, 2.5):
         w = World().launch()
+        if start is None:
+            from replica import tlv
+            start = struct.unpack_from("<d", dict(tlv(w.account_data(LEG_MINTS[0])))[25], 32)[0]
         if mult is not None:
             before = w.account_data(LEG_MINTS[0])
             r = w.issuer_set_multiplier(0, mult, 0)
@@ -546,7 +550,7 @@ def E5_dividend_multiplier_changes_nothing_in_deposit_or_redeem():
         assert w.send([w.ix_redeem(alice, u // 2)], [alice]).ok
         results.append((u, [a - x for a, x in zip(legs_of(w, alice), b)]))
     assert results[0] == results[1], f"multiplier changed the outcome: {results}"
-    return f"NVDAx multiplier 1.0009 → 2.5: deposit and redeem outputs identical ({results[0][0]:,} units)"
+    return f"NVDAx multiplier {start:.4f} → 2.5: deposit and redeem outputs identical ({results[0][0]:,} units)"
 
 
 # ============================================ D — differential vs the reference
@@ -631,7 +635,7 @@ def M2_deploy_cost():
     NOTES["program_bytes"] = elf
     NOTES["deploy_sol_1x"] = one / 1e9
     NOTES["deploy_sol_2x"] = two / 1e9
-    return f"program {elf:,} bytes · ProgramData rent {one/1e9:.3f} SOL (room for same size) / {two/1e9:.3f} SOL (room to double) · a deploy buffer of the same size is needed transiently and refunded"
+    return f"program {elf:,} bytes · ProgramData rent {one/1e9:.3f} SOL (room for same size) / {two/1e9:.3f} SOL (room to double) · the upload buffer is drained back to the payer inside the deploy, so peak need ≈ ProgramData rent + fees (measured: a 3.25 SOL wallet deployed it with 0.07 left)"
 
 
 # ================================================================== runner

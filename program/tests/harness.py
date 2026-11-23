@@ -24,6 +24,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import struct
 from pathlib import Path
 
@@ -39,7 +40,6 @@ from solders.transaction import Transaction
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FIX = ROOT / "fixtures"
-PROGRAM_SO = ROOT / "target" / "deploy" / "permafrost.so"
 
 PROGRAM_ID = Pubkey.from_string("48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2")
 TOKEN_2022 = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
@@ -49,12 +49,26 @@ LOADER_V3 = Pubkey.from_string("BPFLoaderUpgradeab1e11111111111111111111111")
 INCINERATOR = Pubkey.from_string("1nc1nerator11111111111111111111111111111111")
 
 LEGS = ["NVDAx", "GOOGLx", "MSFTx", "METAx"]
-LEG_MINTS = [Pubkey.from_string(s) for s in (
+REAL_MINTS = [Pubkey.from_string(s) for s in (
     "Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh",
     "XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN",
     "XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX",
     "Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu",
 )]
+# Devnet replicas of the four mints (same addresses as `feature = "devnet"` in lib.rs).
+DEVNET_MINTS = [Pubkey.from_string(s) for s in (
+    "A15QnvzoNKst2X2aVaQANvr48kzKVRyYHzP6DXHjppFz",
+    "5dy1EDc71EC9tsJzbbY78ZTh1vdhGMeXQNyPiUKtpGzn",
+    "JCs5xPjRmSBHtYKAWB6PviCAE5TUMPV4UibbKkPpRMGP",
+    "DRcvvyhjF7chPrLbUyoX8DG67j1HYix2WKkHEaHUHHB9",
+)]
+# PF_DEVNET=1: test the `devnet` build against replica mints that the harness
+# CREATES with real Token-2022 instructions (tests/replica.py), instead of the
+# byte-copied mainnet mints. Same suite, both builds.
+DEVNET = os.environ.get("PF_DEVNET") == "1"
+LEG_MINTS = DEVNET_MINTS if DEVNET else REAL_MINTS
+# The devnet build goes to its own folder so it can never be mistaken for the mainnet one.
+PROGRAM_SO = ROOT / "target" / ("deploy-devnet" if DEVNET else "deploy") / "permafrost.so"
 LEG_DECIMALS = 8
 UNIT = 10**9
 SEED_UNITS = 25 * UNIT
@@ -148,10 +162,13 @@ class World:
         self.svm.add_program(TOKEN_2022, (FIX / "token_2022.so").read_bytes())
         self.svm.add_program(ATA_PROGRAM, (FIX / "associated_token.so").read_bytes())
         self._install_program(ADMIN.pubkey() if upgrade_authority is None else upgrade_authority)
-        for m in LEG_MINTS:
-            self._install_mint(m)
         for kp in (ADMIN, ISSUER):
             self.svm.airdrop(kp.pubkey(), 100 * 10**9)
+        for real, m in zip(REAL_MINTS, LEG_MINTS):
+            if DEVNET:
+                self._create_replica(real, m)
+            else:
+                self._install_mint(m)
 
     # ---------------------------------------------------------- installation
     def _install_program(self, authority: Pubkey):
@@ -175,6 +192,24 @@ class World:
             swapped += n
         assert swapped >= 6, f"expected Backed keys in {mint}, swapped {swapped}"
         self.svm.set_account(mint, Account(rec["lamports"], bytes(data), TOKEN_2022, False))
+
+    def _create_replica(self, real: Pubkey, target: Pubkey):
+        """Create a replica with real instructions, then move it to its devnet address.
+
+        The devnet mint keypairs are not in the repo, so the replica is created at a
+        throwaway address and its bytes (which name the mint's own address in the
+        metadata pointer and metadata) are moved to the devnet address.
+        """
+        from replica import check_replica, replica_ixs
+        tmp = det_keypair(f"replica:{real}")
+        ixs, _ = replica_ixs(ISSUER.pubkey(), tmp.pubkey(), ISSUER.pubkey(), real,
+                             self.svm.minimum_balance_for_rent_exemption)
+        r = self.send(ixs, [ISSUER, tmp])
+        assert r.ok, f"replica creation failed: {r.reason()} {r.logs[-5:]}"
+        acc = self.svm.get_account(tmp.pubkey())
+        data = bytes(acc.data).replace(bytes(tmp.pubkey()), bytes(target))
+        check_replica(data, real, ISSUER.pubkey())
+        self.svm.set_account(target, Account(acc.lamports, data, TOKEN_2022, False))
 
     # ---------------------------------------------------------------- basics
     def send(self, ixs, signers, cu: int = 1_400_000) -> TxResult:
