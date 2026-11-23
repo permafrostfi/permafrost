@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>Permafrost Admin</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* Layout: a single operator's console. Status ledger on top, then one card per
+   admin action in launch order. Cold slate palette with a glacial accent. */
+:root{
+  --bg:#eef2f5; --panel:#ffffff; --fg:#13202a; --muted:#56687a; --line:#d3dce4;
+  --accent:#1f6f9a; --accent-ink:#ffffff;
+  --ok:#17784a; --warn:#946200; --bad:#b42318;
+  --display:"Space Grotesk",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace;
+  color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0c1319; --panel:#121c24; --fg:#e2eaf0; --muted:#8fa2b2; --line:#24323d;
+  --accent:#6cb6de; --accent-ink:#06121a; --ok:#5ccf92; --warn:#e2b84a; --bad:#ff8b80; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0c1319; --panel:#121c24; --fg:#e2eaf0; --muted:#8fa2b2; --line:#24323d;
+  --accent:#6cb6de; --accent-ink:#06121a; --ok:#5ccf92; --warn:#e2b84a; --bad:#ff8b80; color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--body);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:28px 64px}
+main{max-width:860px;margin:0 auto;display:grid;gap:20px}
+header{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;justify-content:space-between}
+h1{font:600 1.5rem/1.2 var(--display);margin:0;letter-spacing:-.01em}
+h2{font:600 1.05rem/1.3 var(--display);margin:0}
+p{margin:0}
+.muted{color:var(--muted)}
+.mono{font-family:var(--mono);font-size:13px;word-break:break-all}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;display:grid;gap:14px;min-width:0}
+.seg{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.seg button{border:0;border-radius:0;background:transparent;color:var(--muted);padding:8px 14px}
+.seg button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+button{font:500 14px var(--body);padding:9px 14px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);cursor:pointer}
+button.ghost{background:transparent;color:var(--accent)}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+label{display:grid;gap:4px;font-size:13px;color:var(--muted);min-width:0}
+input{font:14px var(--mono);padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%;min-width:0}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px}
+.ledger{display:grid;grid-template-columns:max-content 1fr;gap:6px 16px;font-size:14px}
+.ledger dt{color:var(--muted)} .ledger dd{margin:0;min-width:0}
+.pill{display:inline-block;font:600 11px var(--body);letter-spacing:.06em;text-transform:uppercase;padding:2px 9px;border-radius:999px;border:1px solid currentColor;white-space:nowrap}
+.ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+.actionhead{display:flex;justify-content:space-between;gap:12px;align-items:baseline;flex-wrap:wrap}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.out{display:grid;gap:8px}
+.out pre{margin:0;max-height:220px;overflow:auto;background:var(--bg);border:1px solid var(--line);border-radius:6px;padding:10px;font:12px/1.45 var(--mono);white-space:pre-wrap;word-break:break-all}
+.confirm{border:1px solid var(--warn);border-radius:8px;padding:12px;display:grid;gap:10px}
+table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums}
+th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)} th{color:var(--muted);font-weight:500}
+td.num,th.num{text-align:right}
+.tablewrap{overflow-x:auto}
+@media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <div style="display:grid;gap:4px">
+      <h1>Permafrost Admin</h1>
+      <p class="muted">Set up the vault, seed it, change the deposit cap, apply upgrades. Every action is simulated first; nothing is sent until you approve it in Phantom.</p>
+    </div>
+    <div class="seg" role="group" aria-label="Network">
+      <button id="net-devnet" type="button" aria-pressed="true">Devnet</button>
+      <button id="net-mainnet" type="button" aria-pressed="false">Mainnet</button>
+    </div>
+  </header>
+
+  <section class="panel">
+    <div class="grid">
+      <label for="rpc">RPC address for this network (kept in this browser only)
+        <input id="rpc" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div class="row">
+      <button id="connect" type="button">Connect Phantom</button>
+      <button id="refresh" type="button" class="ghost">Refresh</button>
+      <span id="who" class="mono muted"></span>
+    </div>
+  </section>
+
+  <section class="panel" aria-labelledby="status-h">
+    <h2 id="status-h">Status</h2>
+    <dl class="ledger" id="ledger"><dt>State</dt><dd class="muted">Not loaded yet.</dd></dl>
+    <div class="tablewrap"><table id="legs" hidden>
+      <thead><tr><th>Leg</th><th>Mint</th><th class="num">In vault</th><th class="num">In your wallet</th></tr></thead>
+      <tbody></tbody>
+    </table></div>
+    <p class="muted" style="font-size:13px">Token amounts are raw balances divided by 10⁸. Phantom shows xStocks multiplied by the issuer's dividend factor, so its figures run slightly higher.</p>
+  </section>
+
+  <section class="panel" id="card-init">
+    <div class="actionhead"><h2>1. Set up the vault</h2><span id="st-init" class="pill muted">—</span></div>
+    <p class="muted">Creates the vault, the PAIF token and the five token accounts. Once only. The name and symbol cannot be changed afterwards.</p>
+    <div class="grid">
+      <label for="init-name">Token name<input id="init-name" value="Permafrost AI Fund" readonly></label>
+      <label for="init-symbol">Symbol<input id="init-symbol" value="PAIF" readonly></label>
+      <label for="init-cap">Deposit cap (units)<input id="init-cap" value="50000" inputmode="numeric"></label>
+    </div>
+    <div class="row"><button id="do-init" type="button">Simulate set-up</button></div>
+    <div class="out" id="out-init"></div>
+  </section>
+
+  <section class="panel" id="card-seed">
+    <div class="actionhead"><h2>2. Seed the vault</h2><span id="st-seed" class="pill muted">—</span></div>
+    <p class="muted">Moves these amounts from your wallet into the vault and creates 25 PAIF that are locked forever. Once only. Every leg must be above zero; the amounts set the basket's starting weights.</p>
+    <div class="grid" id="seed-inputs"></div>
+    <div class="row"><button id="do-seed" type="button">Simulate seed</button><button id="seed-max" type="button" class="ghost">Use my full balances</button></div>
+    <div class="out" id="out-seed"></div>
+  </section>
+
+  <section class="panel" id="card-cap">
+    <div class="actionhead"><h2>3. Change the deposit cap</h2><span id="st-cap" class="pill muted">—</span></div>
+    <p class="muted">Deposits that would take total supply above the cap are refused. Redemptions are never capped.</p>
+    <div class="grid"><label for="cap-new">New cap (units)<input id="cap-new" inputmode="numeric" placeholder="50000"></label></div>
+    <div class="row"><button id="do-cap" type="button">Simulate cap change</button></div>
+    <div class="out" id="out-cap"></div>
+  </section>
+
+  <section class="panel" id="card-upg">
+    <div class="actionhead"><h2>4. Apply an upgrade</h2><span id="st-upg" class="pill muted">—</span></div>
+    <p class="muted">Claude uploads new program code to a buffer and hands the buffer to your address. Paste the buffer address here; the page checks it before you sign. The buffer's rent comes back to your wallet.</p>
+    <div class="grid"><label for="upg-buffer">Buffer address<input id="upg-buffer" spellcheck="false" autocomplete="off"></label></div>
+    <div class="row"><button id="do-upg" type="button">Simulate upgrade</button></div>
+    <div class="out" id="out-upg"></div>
+  </section>
+</main>
+
+<script src="web3-1.98.0.iife.min.js"></script>
+<script>
+"use strict";
+const W = solanaWeb3;
+const PK = s => new W.PublicKey(s);
+
+// ---------------------------------------------------------------- configuration
+const TOKEN_2022 = PK("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+const ATA_PROGRAM = PK("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const LOADER_V3 = PK("BPFLoaderUpgradeab1e11111111111111111111111");
+const LEGS = ["NVDAx","GOOGLx","MSFTx","METAx"];
+const NETWORKS = {
+  devnet: {
+    label: "Devnet", cluster: "devnet", rpc: "https://api.devnet.solana.com",
+    program: "48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2",
+    mints: ["A15QnvzoNKst2X2aVaQANvr48kzKVRyYHzP6DXHjppFz","5dy1EDc71EC9tsJzbbY78ZTh1vdhGMeXQNyPiUKtpGzn",
+            "JCs5xPjRmSBHtYKAWB6PviCAE5TUMPV4UibbKkPpRMGP","DRcvvyhjF7chPrLbUyoX8DG67j1HYix2WKkHEaHUHHB9"],
+  },
+  mainnet: {
+    label: "Mainnet", cluster: "", rpc: "",
+    program: null, // set when the mainnet program is deployed
+    mints: ["Xsc9qvGR1efVDFGLrVsmkzv3qi45LTBjeUKSPmx9qEh","XsCPL9dNWBMvFtTmwcCA5v3xWPSMEBCszbQdiLLq6aN",
+            "XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX","Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu"],
+  },
+};
+const DISC = { initialize:[175,175,109,31,13,152,155,237], seed:[255,178,140,239,113,22,214,231], set_cap:[209,207,121,129,115,39,220,4] };
+const VAULT_DISC = [228,196,82,165,98,210,235,152];
+const UNIT = 1_000_000_000n, LEG_DEC = 8;
+const MAX_CAP_UNITS = 50_000n; // E1: not above 50,000 until custody improves
+
+// ---------------------------------------------------------------- small helpers
+const $ = id => document.getElementById(id);
+const store = { get(k){try{return localStorage.getItem(k)}catch{return null}}, set(k,v){try{localStorage.setItem(k,v)}catch{}} };
+const u64 = v => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), true); return b; };
+const str = s => { const e = new TextEncoder().encode(s); const b = new Uint8Array(4+e.length); new DataView(b.buffer).setUint32(0,e.length,true); b.set(e,4); return b; };
+const cat = (...a) => { const n=a.reduce((s,x)=>s+x.length,0), o=new Uint8Array(n); let i=0; for(const x of a){o.set(x,i);i+=x.length} return o; };
+const readU64 = (d,o) => new DataView(d.buffer,d.byteOffset,d.byteLength).getBigUint64(o,true);
+const fmt = (raw, dec) => { const s = raw.toString().padStart(dec+1,"0"); const i=s.slice(0,-dec), f=s.slice(-dec).replace(/0+$/,""); return (+i).toLocaleString("en-US") + (f?"."+f:""); };
+const parseDec = (txt, dec) => { const t=String(txt).trim().replace(/,/g,""); if(!/^\d+(\.\d+)?$/.test(t)) throw new Error("Enter a plain number, e.g. 0.0291"); const [i,f=""]=t.split("."); if(f.length>dec) throw new Error(`At most ${dec} decimal places`); return BigInt(i)*10n**BigInt(dec)+BigInt((f+"0".repeat(dec)).slice(0,dec)); };
+const esc = s => String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const explorer = (sig, net) => `https://solscan.io/tx/${sig}${net.cluster?"?cluster="+net.cluster:""}`;
+
+// ---------------------------------------------------------------- state
+let netKey = "devnet", net, conn, A = null, wallet = null, chain = {};
+function provider(){ return (window.phantom && window.phantom.solana) || (window.solana && window.solana.isPhantom ? window.solana : null); }
+
+function derive(n){
+  if(!n.program) return null;
+  const program = PK(n.program);
+  const pda = seeds => W.PublicKey.findProgramAddressSync(seeds, program)[0];
+  const ata = (owner, mint) => W.PublicKey.findProgramAddressSync([owner.toBuffer(), TOKEN_2022.toBuffer(), mint.toBuffer()], ATA_PROGRAM)[0];
+  const vault = pda([new TextEncoder().encode("vault")]);
+  const unitMint = pda([new TextEncoder().encode("unit_mint")]);
+  const deadOwner = pda([new TextEncoder().encode("dead")]);
+  const mints = n.mints.map(PK);
+  return { program, ata, vault, unitMint, deadOwner, deadUnits: ata(deadOwner, unitMint), mints,
+    vaultLegs: mints.map(m => ata(vault, m)),
+    programData: W.PublicKey.findProgramAddressSync([program.toBuffer()], LOADER_V3)[0] };
+}
+
+function selectNet(k){
+  netKey = k; net = NETWORKS[k];
+  $("net-devnet").setAttribute("aria-pressed", k==="devnet"); $("net-mainnet").setAttribute("aria-pressed", k==="mainnet");
+  $("rpc").value = store.get("pf-rpc-"+k) || net.rpc;
+  $("rpc").placeholder = k==="mainnet" ? "https://mainnet.helius-rpc.com/?api-key=…" : net.rpc;
+  A = derive(net);
+  for (const id of ["init","seed","cap","upg"]) $("out-"+id).innerHTML = "";
+  renderSeedInputs();
+  refresh();
+}
+
+// ---------------------------------------------------------------- reading the chain
+let refreshSeq = 0;
+async function refresh(){
+  const seq = ++refreshSeq;  // a slower, older read must never overwrite a newer one
+  const L = $("ledger"), T = $("legs");
+  const rpc = $("rpc").value.trim();
+  if(!A){ L.innerHTML = `<dt>Program</dt><dd><span class="pill warn">not deployed</span> The ${net.label} program has not been deployed yet.</dd>`; T.hidden = true; gate(); return; }
+  if(!rpc){ L.innerHTML = `<dt>RPC</dt><dd><span class="pill warn">missing</span> Paste this network's RPC address above.</dd>`; T.hidden = true; gate(); return; }
+  conn = new W.Connection(rpc, "confirmed");
+  L.innerHTML = `<dt>State</dt><dd class="muted">Reading…</dd>`;
+  try{
+    const keys = [A.programData, A.vault, A.unitMint, A.deadUnits, ...A.vaultLegs];
+    if(wallet) keys.push(wallet, ...A.mints.map(m => A.ata(wallet, m)));
+    const accs = await conn.getMultipleAccountsInfo(keys);
+    if(seq !== refreshSeq) return;
+    const [pd, v, um, du, ...rest] = accs;
+    const vl = rest.slice(0,4), w = wallet ? rest[4] : null, wl = wallet ? rest.slice(5,9) : [null,null,null,null];
+    const bal = a => a ? readU64(a.data, 64) : 0n;
+    chain = {
+      deployed: !!pd,
+      authority: pd && pd.data[12] === 1 ? new W.PublicKey(pd.data.slice(13,45)) : null,
+      vault: !!v && v.data.length >= 19 && VAULT_DISC.every((b,i)=>v.data[i]===b),
+      cap: v ? readU64(v.data, 11) : 0n,
+      supply: um ? readU64(um.data, 36) : 0n,
+      dead: bal(du),
+      holdings: vl.map(bal),
+      walletLegs: wl.map(bal),
+      sol: w ? w.lamports : 0,
+    };
+    const isAdmin = wallet && chain.authority && chain.authority.equals(wallet);
+    const rows = [
+      ["Program", `<span class="mono">${A.program.toBase58()}</span> ${chain.deployed?'<span class="pill ok">deployed</span>':'<span class="pill bad">not found</span>'}`],
+      ["Upgrade authority", chain.authority ? `<span class="mono">${chain.authority.toBase58()}</span> ${wallet ? (isAdmin?'<span class="pill ok">this is you</span>':'<span class="pill bad">not your wallet</span>') : ''}` : (chain.deployed?'<span class="pill bad">none: program is immutable</span>':'—')],
+      ["Vault", chain.vault ? `<span class="pill ok">set up</span> cap ${fmt(chain.cap,9)} units` : '<span class="pill warn">not set up</span>'],
+      ["PAIF supply", chain.vault ? `${fmt(chain.supply,9)} units, of which ${fmt(chain.dead,9)} locked forever` : '—'],
+    ];
+    if(wallet) rows.push(["Your SOL", (chain.sol/1e9).toLocaleString("en-US",{maximumFractionDigits:4})]);
+    L.innerHTML = rows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
+    T.querySelector("tbody").innerHTML = LEGS.map((l,i) => `<tr><td>${l}</td><td class="mono">${A.mints[i].toBase58().slice(0,6)}…</td><td class="num">${fmt(chain.holdings[i],LEG_DEC)}</td><td class="num">${wallet?fmt(chain.walletLegs[i],LEG_DEC):"—"}</td></tr>`).join("");
+    T.hidden = false;
+  }catch(e){
+    if(seq !== refreshSeq) return;
+    L.innerHTML = `<dt>Error</dt><dd class="bad">Could not read the network: ${esc(e.message||e)}. Check the RPC address.</dd>`; T.hidden = true;
+  }
+  gate();
+}
+
+function gate(){
+  const isAdmin = !!(wallet && chain.authority && chain.authority.equals(wallet));
+  const set = (id, on, label, cls) => { $("do-"+id).disabled = !on; const s=$("st-"+id); s.textContent=label; s.className="pill "+cls; };
+  if(!A || !chain.deployed){ for(const id of ["init","seed","cap","upg"]) set(id,false,"unavailable","muted"); return; }
+  if(!wallet){ for(const id of ["init","seed","cap","upg"]) set(id,false,"connect first","muted"); return; }
+  if(!isAdmin){ for(const id of ["init","seed","cap","upg"]) set(id,false,"not admin","bad"); return; }
+  set("init", !chain.vault, chain.vault ? "done" : "ready", chain.vault ? "ok" : "warn");
+  set("seed", chain.vault && chain.supply === 0n, !chain.vault ? "after set-up" : chain.supply>0n ? "done" : "ready", chain.supply>0n ? "ok" : chain.vault ? "warn" : "muted");
+  set("cap", chain.vault, chain.vault ? "available" : "after set-up", chain.vault ? "ok" : "muted");
+  set("upg", true, "available", "ok");
+}
+
+function renderSeedInputs(){
+  $("seed-inputs").innerHTML = LEGS.map((l,i) => `<label for="seed-${i}">${l}<input id="seed-${i}" inputmode="decimal" placeholder="0.0"></label>`).join("");
+}
+
+// ---------------------------------------------------------------- instructions
+const meta = (pubkey, isSigner, isWritable) => ({ pubkey, isSigner, isWritable });
+const adminMetas = (adminWritable) => [meta(wallet,true,adminWritable), meta(A.program,false,false), meta(A.programData,false,false)];
+
+function ixInitialize(capUnits){
+  const keys = [...adminMetas(true), meta(A.vault,false,true), meta(A.unitMint,false,true),
+    ...A.mints.map(m=>meta(m,false,false)), ...A.vaultLegs.map(v=>meta(v,false,true)),
+    meta(A.deadOwner,false,false), meta(A.deadUnits,false,true),
+    meta(TOKEN_2022,false,false), meta(ATA_PROGRAM,false,false), meta(W.SystemProgram.programId,false,false)];
+  const data = cat(Uint8Array.from(DISC.initialize), u64(capUnits*UNIT), str($("init-name").value), str($("init-symbol").value), str(""));
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(data) });
+}
+function ixSeed(amounts){
+  const keys = [...adminMetas(false), meta(A.vault,false,false), meta(A.unitMint,false,true),
+    ...A.mints.map(m=>meta(m,false,false)), ...A.vaultLegs.map(v=>meta(v,false,true)),
+    ...A.mints.map(m=>meta(A.ata(wallet,m),false,true)),
+    meta(A.deadOwner,false,false), meta(A.deadUnits,false,true), meta(TOKEN_2022,false,false)];
+  const data = cat(Uint8Array.from(DISC.seed), ...amounts.map(u64));
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(data) });
+}
+function ixSetCap(capUnits){
+  const keys = [...adminMetas(false), meta(A.vault,false,true)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.set_cap), u64(capUnits*UNIT))) });
+}
+function ixUpgrade(buffer){
+  const keys = [meta(A.programData,false,true), meta(A.program,false,true), meta(buffer,false,true), meta(wallet,false,true),
+    meta(W.SYSVAR_RENT_PUBKEY,false,false), meta(W.SYSVAR_CLOCK_PUBKEY,false,false), meta(wallet,true,false)];
+  return new W.TransactionInstruction({ programId: LOADER_V3, keys, data: toBuf(Uint8Array.from([3,0,0,0])) });
+}
+function toBuf(u8){ return (typeof Buffer !== "undefined") ? Buffer.from(u8) : u8; }
+
+// ---------------------------------------------------------------- simulate → confirm → sign
+async function run(kind, build, summary){
+  const out = $("out-"+kind);
+  out.innerHTML = `<p class="muted">Simulating…</p>`;
+  let ixs;
+  try{ ixs = build(); }catch(e){ out.innerHTML = `<p class="bad">${esc(e.message||e)}</p>`; return; }
+  const cu = kind === "init" ? 300_000 : 200_000;
+  const make = async () => {
+    const tx = new W.Transaction().add(W.ComputeBudgetProgram.setComputeUnitLimit({ units: cu }), ...ixs);
+    tx.feePayer = wallet;
+    tx.recentBlockhash = (await conn.getLatestBlockhash("confirmed")).blockhash;
+    return tx;
+  };
+  try{
+    const sim = await conn.simulateTransaction(await make());
+    const logs = (sim.value.logs || []).join("\n");
+    if(sim.value.err){
+      out.innerHTML = `<p class="bad"><b>Simulation failed.</b> Nothing was sent. ${esc(explainErr(sim.value.err, sim.value.logs))}</p><pre>${esc(logs)}</pre>`;
+      return;
+    }
+    out.innerHTML = `<div class="confirm"><p><b>Simulation passed</b> (${sim.value.unitsConsumed?.toLocaleString("en-US") ?? "?"} compute units). ${summary}</p>
+      <div class="row"><button type="button" id="go-${kind}">Sign and send in Phantom</button><button type="button" class="ghost" id="no-${kind}">Cancel</button></div></div>
+      <details><summary class="muted">Simulation log</summary><pre>${esc(logs)}</pre></details>`;
+    $("no-"+kind).onclick = () => { out.innerHTML = `<p class="muted">Cancelled. Nothing was sent.</p>`; };
+    $("go-"+kind).onclick = async () => {
+      $("go-"+kind).disabled = true;
+      out.insertAdjacentHTML("beforeend", `<p class="muted" id="wait-${kind}">Waiting for Phantom…</p>`);
+      try{
+        const tx = await make();
+        const { signature } = await provider().signAndSendTransaction(tx);
+        $("wait-"+kind).textContent = "Sent. Waiting for confirmation…";
+        const bh = await conn.getLatestBlockhash("confirmed");
+        const res = await conn.confirmTransaction({ signature, ...bh }, "confirmed");
+        if(res.value.err) throw new Error("Failed on chain: " + JSON.stringify(res.value.err));
+        out.innerHTML = `<p class="ok"><b>Done.</b> <a href="${explorer(signature, net)}" target="_blank" rel="noopener">View on Solscan</a></p><p class="mono muted">${signature}</p>`;
+        refresh();
+      }catch(e){
+        const w = $("wait-"+kind); if(w) w.remove();
+        out.insertAdjacentHTML("beforeend", `<p class="bad">${esc(/reject/i.test(e.message||"") ? "You declined in Phantom. Nothing was sent." : (e.message||e))}</p>`);
+        const g = $("go-"+kind); if(g) g.disabled = false;
+      }
+    };
+  }catch(e){ out.innerHTML = `<p class="bad">Could not simulate: ${esc(e.message||e)}</p>`; }
+}
+
+const PF_ERRORS = ["Unauthorized: this wallet is not the upgrade authority","Already seeded","Deposit cap exceeded","Slippage (units)","Slippage (leg)","Wrong account passed","Name, symbol or link too long","Overflow","Unexpected fee","Vault not seeded","A leg is empty","Amount too small (dust)","Bad redemption","Bad seed: every leg must be above zero","Arithmetic error"];
+function explainErr(err, logs){
+  const m = JSON.stringify(err).match(/"Custom":(\d+)/);
+  if(m){ const c = +m[1]; if(c>=6000 && c<6000+PF_ERRORS.length) return PF_ERRORS[c-6000]+"."; return "Program error "+c+"."; }
+  const line = (logs||[]).find(l => /Error|insufficient/i.test(l));
+  return line ? line.replace(/^Program log: /,"") : JSON.stringify(err);
+}
+
+// ---------------------------------------------------------------- actions
+$("do-init").onclick = () => run("init", () => {
+  const cap = BigInt($("init-cap").value.trim() || "0");
+  if(cap <= 0n) throw new Error("Enter a cap above zero.");
+  if(cap > MAX_CAP_UNITS) throw new Error("The agreed launch cap is at most 50,000 units.");
+  return [ixInitialize(cap)];
+}, `This sets up the vault with a cap of ${Number($("init-cap").value||0).toLocaleString("en-US")} units, name “${esc($("init-name").value)}” and symbol “${esc($("init-symbol").value)}”. It costs about 0.02 SOL in account rent.`);
+
+$("seed-max").onclick = () => { LEGS.forEach((_,i) => { $("seed-"+i).value = chain.walletLegs ? fmt(chain.walletLegs[i], LEG_DEC).replace(/,/g,"") : ""; }); };
+$("do-seed").onclick = () => {
+  let amounts;
+  try{ amounts = LEGS.map((l,i) => { const v = parseDec($("seed-"+i).value, LEG_DEC); if(v===0n) throw new Error(`${l} must be above zero.`); if(chain.walletLegs && v > chain.walletLegs[i]) throw new Error(`You hold less ${l} than that.`); return v; }); }
+  catch(e){ $("out-seed").innerHTML = `<p class="bad">${esc(e.message)}</p>`; return; }
+  run("seed", () => [ixSeed(amounts)], `This moves ${amounts.map((a,i)=>fmt(a,LEG_DEC)+" "+LEGS[i]).join(", ")} into the vault and locks 25 PAIF forever. It cannot be undone.`);
+};
+$("do-cap").onclick = () => run("cap", () => {
+  const cap = BigInt(($("cap-new").value||"").trim().replace(/,/g,"") || "0");
+  if(cap <= 0n) throw new Error("Enter a cap above zero.");
+  if(cap > MAX_CAP_UNITS) throw new Error("Agreed: no cap above 50,000 units until custody improves.");
+  return [ixSetCap(cap)];
+}, `This changes the deposit cap to ${Number(($("cap-new").value||"0").replace(/,/g,"")).toLocaleString("en-US")} units.`);
+$("do-upg").onclick = async () => {
+  const out = $("out-upg");
+  let buf;
+  try{ buf = PK($("upg-buffer").value.trim()); }catch{ out.innerHTML = `<p class="bad">That is not a valid address.</p>`; return; }
+  const acc = await conn.getAccountInfo(buf);
+  if(!acc || !acc.owner.equals(LOADER_V3) || acc.data[0] !== 1){ out.innerHTML = `<p class="bad">That address is not a program buffer.</p>`; return; }
+  const bAuth = acc.data[4] === 1 ? new W.PublicKey(acc.data.slice(5,37)) : null;
+  if(!bAuth || !bAuth.equals(wallet)){ out.innerHTML = `<p class="bad">The buffer's authority is ${bAuth?bAuth.toBase58():"none"}, not your wallet. Ask Claude to hand it over first.</p>`; return; }
+  const code = acc.data.slice(37);
+  const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", code))).map(b=>b.toString(16).padStart(2,"0")).join("");
+  run("upg", () => [ixUpgrade(buf)], `This replaces the program's code with the buffer's (${code.length.toLocaleString("en-US")} bytes, SHA-256 <span class="mono">${digest.slice(0,16)}…</span>; compare with the hash Claude gave you). The buffer's rent returns to your wallet.`);
+};
+
+// ---------------------------------------------------------------- wallet
+$("connect").onclick = async () => {
+  const p = provider();
+  if(!p){ $("who").textContent = "Phantom not found. Install it or open this page in the browser that has it."; return; }
+  try{ const r = await p.connect(); wallet = new W.PublicKey(r.publicKey.toString()); $("who").textContent = wallet.toBase58(); $("connect").textContent = "Connected"; refresh(); }
+  catch(e){ $("who").textContent = "Connection declined."; }
+};
+$("refresh").onclick = refresh;
+$("rpc").addEventListener("change", () => { store.set("pf-rpc-"+netKey, $("rpc").value.trim()); refresh(); });
+$("net-devnet").onclick = () => selectNet("devnet");
+$("net-mainnet").onclick = () => selectNet("mainnet");
+selectNet("devnet");
+</script>
+</body>
+</html>
