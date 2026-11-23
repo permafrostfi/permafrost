@@ -392,15 +392,19 @@ def A16_vault_owned_account_as_a_redemption_destination():
 def A17_attacker_brings_their_own_program_data():
     """The realistic version: the attacker deploys their OWN program, so they hold a
     genuine ProgramData naming themselves as upgrade authority, and passes it in."""
-    w = World().launch()
+    # v1: set_cap is the upgrade-authority-gated instruction to attack. v3: set_cap
+    # uses the stored admin key; the upgrade-authority gate guards init_v3 instead.
+    w = World().launch(v3=False)
+    gated = (lambda who, **kw: w.ix_set_cap(who, 10**18, **kw)) if V1_LAYOUT else \
+            (lambda who, **kw: w.ix_init_v3(who, **kw))
     mallory = w.new_user("mallory")
     their_program = det_keypair("mallory-program").pubkey()
     their_pd = pda([bytes(their_program)], LOADER_V3)
     data = struct.pack("<IQ", 3, 0) + b"\x01" + bytes(mallory.pubkey()) + b"\x00" * 64
     w.svm.set_account(their_pd, Account(10**9, data, LOADER_V3, False))
-    ix = w.ix_set_cap(mallory, 10**18, override={2: their_pd})
+    ix = gated(mallory, override={2: their_pd})
     must_fail(w.send([ix], [mallory]), code=ERR["Unauthorized"], why="ProgramData must be OUR program's")
-    ix = w.ix_set_cap(mallory, 10**18, override={1: their_program, 2: their_pd})
+    ix = gated(mallory, override={1: their_program, 2: their_pd})
     must_fail(w.send([ix], [mallory]), why="program slot must be our program")
     assert w.vault_cap() == CAP_50K
     return "foreign ProgramData refused · foreign program refused · cap unchanged"
@@ -418,6 +422,9 @@ def A18_burning_someone_elses_units():
 
 @test
 def A19_upgrade_authority_burnt_means_admin_powers_end():
+    if not V1_LAYOUT:
+        return ("SKIPPED on v3 by design: v3 moves admin powers to a stored key so the "
+                "upgrade authority can be destroyed without losing them (see test_v3 K2)")
     w = World(upgrade_authority=ADMIN.pubkey()).launch()
     data = bytearray(w.account_data(PROGRAM_DATA))
     data[12] = 0                                    # Option<Pubkey> → None: authority burnt

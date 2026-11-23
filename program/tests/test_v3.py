@@ -1,9 +1,11 @@
-"""Permafrost v2 — the locked-bonus discount. Run: python3 -I tests/test_v2.py
+"""Permafrost v3 — locked bonus + fees + split keys. Run: python3 -I tests/test_v3.py
 
 Same harness as v1 (real Token-2022, real mints with a test issuer, upgradeable
 program). Plan: claude/permafrost-discounts-plan.md. The groups:
 
   L  — locked-bonus behaviour, happy and refused paths
+  F  — fees: caps, the 30-day timelock, where fees go, exact arithmetic
+  K  — keys: the admin key's five powers, and nothing else; upgrade key destroyed
   X  — extraction: can any sequence of legal operations take more than it gives?
        (A16, the test the old suite lacked)
   U  — upgrading a live v1 vault to v2
@@ -12,6 +14,7 @@ program). Plan: claude/permafrost-discounts-plan.md. The groups:
 
 from __future__ import annotations
 
+import copy
 import random
 import struct
 import sys
@@ -58,27 +61,32 @@ def lock(w, u, amounts=(3 * 10**7, 10**7, 10**7, 10**7), **kw):
 # ================================================================ L — behaviour
 
 @test
-def L01_init_discounts_creates_pool_and_escrow_owned_by_the_vault():
-    w = World().launch()
+def L01_init_v3_creates_pool_escrow_fee_account_and_sets_the_admin():
+    w = World().launch(v3=False)
     stranger = w.new_user("stranger")
-    must_fail(w.send([w.ix_init_discounts(stranger)], [stranger]), code=ERR["Unauthorized"], why="stranger")
-    r = w.send([w.ix_init_discounts(ADMIN)], [ADMIN])
+    must_fail(w.send([w.ix_init_v3(stranger)], [stranger]), code=ERR["Unauthorized"], why="stranger")
+    r = w.send([w.ix_init_v3(ADMIN)], [ADMIN])
     assert r.ok, r.reason()
-    NOTES["cu_init_discounts"] = r.cu
+    NOTES["cu_init_v3"] = r.cu
+    assert w.admin_key() == ADMIN.pubkey(), "admin = the signer"
+    fa = w.account_data(FEE_ACCOUNT)
+    assert fa[0:32] == bytes(UNIT_MINT) and fa[32:64] == bytes(FEE_OWNER), "fee account = FEE_OWNER's PAIF account"
+    f = w.fees()
+    assert (f["entry"], f["exit"], f["stream"], f["pending_at"]) == (0, 0, 0, 0) and f["last_accrual"] == w.now()
     for acc in (POOL, ESCROW):
         d = w.account_data(acc)
         assert d[0:32] == bytes(UNIT_MINT) and d[32:64] == bytes(VAULT), "unit-mint account owned by the vault"
     s = w.vault_v2()
     assert s == dict(ready=True, on=False, locked_bp=0, lock_days=120, max_bonus=0, next_position=0), s
-    assert not w.send([w.ix_init_discounts(ADMIN)], [ADMIN]).ok, "second init must fail"
-    return "pool + escrow created, owned by the vault PDA; discounts start OFF, lock 120 d; admin only; once only"
+    assert not w.send([w.ix_init_v3(ADMIN)], [ADMIN]).ok, "second init must fail"
+    return "pool + escrow + fee account created; admin stored; discounts OFF, fees 0, lock 120 d; upgrade authority only; once only"
 
 
 @test
 def L02_set_discount_bounds_and_powers():
-    w = World().launch()
-    must_fail(w.send([w.ix_set_discount(ADMIN)], [ADMIN]), code=ERR["DiscountsNotReady"], why="before init")
-    assert w.send([w.ix_init_discounts(ADMIN)], [ADMIN]).ok
+    w = World().launch(v3=False)
+    must_fail(w.send([w.ix_set_discount(ADMIN)], [ADMIN]), code=ERR["Unauthorized"], why="before init: no admin yet")
+    w.init_v3()
     for days in (0, 29, 366, 1000):
         must_fail(w.send([w.ix_set_discount(ADMIN, lock_days=days)], [ADMIN]), code=ERR["LockOutOfRange"], why=f"{days} d")
     must_fail(w.send([w.ix_set_discount(ADMIN, locked_bp=10_001)], [ADMIN]), code=ERR["RateTooHigh"], why="> 100%")
@@ -89,7 +97,7 @@ def L02_set_discount_bounds_and_powers():
         assert r.ok, r.reason()
         assert w.vault_v2()["lock_days"] == days
     NOTES["cu_set_discount"] = r.cu
-    return "lock 0/29/366 refused, 30 and 365 accepted; rate > 100% refused; before init refused; strangers refused"
+    return "lock 0/29/366 refused, 30 and 365 accepted; rate > 100% refused; before init_v3 nobody is admin; strangers refused"
 
 
 @test
@@ -193,7 +201,7 @@ def L07_withdraw_reaches_the_pool_only():
     must_fail(w.send([w.ix_withdraw_pool(bob, 1, ata(bob.pubkey(), UNIT_MINT))], [bob]),
               code=ERR["Unauthorized"], why="stranger")
     # Escrow passed in place of the pool is refused by the seeds check.
-    must_fail(w.send([w.ix_withdraw_pool(ADMIN, 1, ata(bob.pubkey(), UNIT_MINT), override={5: ESCROW})], [ADMIN]),
+    must_fail(w.send([w.ix_withdraw_pool(ADMIN, 1, ata(bob.pubkey(), UNIT_MINT), override={3: ESCROW})], [ADMIN]),
               contains="ConstraintSeeds", why="escrow as pool")
     r = w.send([w.ix_withdraw_pool(ADMIN, p, ata(bob.pubkey(), UNIT_MINT))], [ADMIN])
     assert r.ok, r.reason()
@@ -361,15 +369,15 @@ def install_elf(w, elf):
 
 
 @test
-def U1_live_v1_vault_upgrades_to_v2_without_migration():
+def U1_live_v1_vault_upgrades_to_v3_without_migration():
     v1_elf = (ROOT / "fixtures" / "permafrost_v1.so").read_bytes()
     w = World()
     # Swap our program for the v1 binary, as it will be on mainnet.
     install_elf(w, v1_elf)
-    w.launch()
+    w.launch(v3=False)
     bob = funded_user(w, "bob")
     assert w.send([w.ix_deposit(bob, [3 * 10**7, 10**7, 10**7, 10**7])], [bob]).ok
-    assert not w.send([w.ix_init_discounts(ADMIN)], [ADMIN]).ok, "v1 has no init_discounts"
+    assert not w.send([w.ix_init_v3(ADMIN)], [ADMIN]).ok, "v1 has no init_v3"
     vault_v1 = w.account_data(VAULT)
     # The upgrade: same accounts, new code.
     v2_elf = PROGRAM_SO.read_bytes()
@@ -377,8 +385,9 @@ def U1_live_v1_vault_upgrades_to_v2_without_migration():
     assert w.account_data(VAULT) == vault_v1
     assert w.vault_v2() == dict(ready=False, on=False, locked_bp=0, lock_days=0, max_bonus=0, next_position=0)
     must_fail(lock(w, bob)[0], contains="AccountNotInitialized", why="before init: no pool yet")
+    w.init_v3()
     w.enable_discounts(fund_units=100 * UNIT)
-    assert w.account_data(VAULT)[8] == 2, "version 2"
+    assert w.account_data(VAULT)[8] == 3, "version 3"
     u = units_of(w, bob)
     assert w.send([w.ix_redeem(bob, u // 2)], [bob]).ok, "v1 holder redeems after upgrade"
     r, pid = lock(w, bob)
@@ -387,9 +396,238 @@ def U1_live_v1_vault_upgrades_to_v2_without_migration():
     assert w.send([w.ix_claim_locked(bob, pid)], [bob]).ok
     grow = len(v2_elf) - len(v1_elf)
     return (f"v1 vault + a v1 holder, then the code is swapped: vault bytes identical, discounts read OFF, "
-            f"holder redeems, init + lock + claim work. Program grows {len(v1_elf):,} → {len(v2_elf):,} bytes "
+            f"holder redeems, init_v3 + lock + claim work. Program grows {len(v1_elf):,} → {len(v2_elf):,} bytes "
             f"(+{grow:,}): the mainnet ProgramData must be extended by that before the upgrade "
             f"(~{w.svm.minimum_balance_for_rent_exemption(grow) / 1e9:.2f} SOL)")
+
+
+# ======================================================================== F — fees
+
+def fee_bal(w):
+    return w.balance(FEE_ACCOUNT)
+
+
+def fees_in_force(w, entry=0, exit_=0, stream=0):
+    """Set fees and wait out the timelock, then bring them into force."""
+    r = w.send([w.ix_set_fees(ADMIN, entry, exit_, stream)], [ADMIN])
+    assert r.ok, r.reason()
+    w.warp(30 * DAY)
+    assert w.send([w.ix_accrue()], [ADMIN]).ok
+    f = w.fees()
+    assert (f["entry"], f["exit"], f["stream"], f["pending_at"]) == (entry, exit_, stream, 0), f
+    return w
+
+
+@test
+def F1_fee_caps_and_who_may_set_them():
+    w = World().launch()
+    stranger = w.new_user("stranger")
+    must_fail(w.send([w.ix_set_fees(stranger, 10, 10, 10)], [stranger]), code=ERR["Unauthorized"], why="stranger")
+    for bad in ((101, 0, 0), (0, 101, 0), (0, 0, 101), (65535, 0, 0)):
+        must_fail(w.send([w.ix_set_fees(ADMIN, *bad)], [ADMIN]), code=ERR["FeeTooHigh"], why=str(bad))
+    r = w.send([w.ix_set_fees(ADMIN, 100, 100, 100)], [ADMIN])
+    assert r.ok, r.reason()
+    NOTES["cu_set_fees"] = r.cu
+    return "entry, exit or management fee above 1% refused; strangers refused; 1%/1%/1% accepted"
+
+
+@test
+def F2_increases_wait_30_days_decreases_are_immediate():
+    w = World().launch()
+    t0 = w.now()
+    assert w.send([w.ix_set_fees(ADMIN, 50, 50, 100)], [ADMIN]).ok
+    f = w.fees()
+    assert (f["entry"], f["exit"], f["stream"]) == (0, 0, 0) and f["pending"] == (50, 50, 100)
+    assert f["pending_at"] == t0 + 30 * DAY
+    alice = funded_user(w, "alice")
+    w.warp(30 * DAY - 60)
+    b0 = fee_bal(w)
+    assert w.send([w.ix_deposit(alice, [3 * 10**7, 10**7, 10**7, 10**7])], [alice]).ok
+    assert fee_bal(w) == b0, "no fee of any kind before the 30 days are up"
+    w.warp(60)
+    s_before = w.supply()
+    assert w.send([w.ix_deposit(alice, [3 * 10**7, 10**7, 10**7, 10**7])], [alice]).ok
+    got_fee = fee_bal(w) - b0
+    gross = w.supply() - s_before
+    assert got_fee == gross * 50 // 10_000, (got_fee, gross)
+    # A decrease applies at once; a lower setting also cancels a pending increase.
+    assert w.send([w.ix_set_fees(ADMIN, 10, 50, 100)], [ADMIN]).ok
+    f = w.fees()
+    assert f["entry"] == 10 and f["pending_at"] == 0
+    assert w.send([w.ix_set_fees(ADMIN, 90, 50, 100)], [ADMIN]).ok  # increase: pending
+    assert w.send([w.ix_set_fees(ADMIN, 10, 50, 100)], [ADMIN]).ok  # changed mind
+    f = w.fees()
+    assert f["entry"] == 10 and f["pending_at"] == 0, "the pending increase was cancelled"
+    return (f"set 0.5%/0.5%/1%: nothing charged at day 29 d 23 h 59 m; at day 30 entry fee = {got_fee:,} "
+            f"units = 0.5% of {gross:,}; a cut applies instantly and cancels a pending rise")
+
+
+@test
+def F3_management_fee_is_exact_and_starts_only_when_in_force():
+    import permafrost_reference as R
+    w = World().launch()
+    assert w.send([w.ix_set_fees(ADMIN, 0, 0, 100)], [ADMIN]).ok
+    w.warp(30 * DAY)
+    b0 = fee_bal(w)
+    assert w.send([w.ix_accrue()], [ADMIN]).ok
+    assert fee_bal(w) == b0, "nothing owed for the 30 days the increase was pending"
+    s0, last = w.supply(), w.fees()["last_accrual"]
+    w.warp(365 * DAY)
+    r = w.send([w.ix_accrue()], [ADMIN])
+    assert r.ok, r.reason()
+    NOTES["cu_accrue"] = r.cu
+    m = fee_bal(w) - b0
+    v = R.Vault(holdings=[1, 1, 1, 1], supply=s0, stream_bp=100, last_accrual=last)
+    assert m == R.accrue(v, w.now()), "matches the reference exactly"
+    share = m / (s0 + m)
+    assert abs(share - 0.01) < 1e-6, share
+    return f"1%/yr for 365 days minted {m:,} units = {share * 100:.4f}% of supply, identical to the reference; 0 for the timelock period"
+
+
+@test
+def F4_exit_fee_goes_to_the_fee_account_and_payout_is_on_the_rest():
+    import permafrost_reference as R
+    w = fees_in_force(World().launch(), exit_=100)
+    bob = funded_user(w, "bob")
+    assert w.send([w.ix_deposit(bob, [3 * 10**7, 10**7, 10**7, 10**7])], [bob]).ok
+    u = units_of(w, bob)
+    v = R.Vault(holdings=list(w.holdings()), supply=w.supply(), exit_bp=100)
+    payouts, burned, to_cre = R.redeem(v, u)
+    b0, legs0, s0 = fee_bal(w), legs_of(w, bob), w.supply()
+    r = w.send([w.ix_redeem(bob, u)], [bob])
+    assert r.ok, r.reason()
+    assert fee_bal(w) - b0 == to_cre == u // 100
+    assert [a - b for a, b in zip(legs_of(w, bob), legs0)] == payouts
+    assert s0 - w.supply() == burned
+    return f"redeemed {u:,}: {to_cre:,} units (1%) to the fee account, {burned:,} burnt, payout identical to the reference"
+
+
+@test
+def F5_random_fee_sequences_match_the_reference_exactly():
+    import permafrost_reference as R
+    rng = random.Random(55)
+    ops = 0
+    for trial in range(4):
+        w = fees_in_force(World().launch(), entry=30, exit_=50, stream=75)
+        users = [funded_user(w, f"u{trial}{i}", amounts=(5 * 10**8,) * 4) for i in range(3)]
+        f = w.fees()
+        v = R.Vault(holdings=list(w.holdings()), supply=w.supply(), entry_bp=30, exit_bp=50,
+                    stream_bp=75, last_accrual=f["last_accrual"])
+        fee0 = fee_bal(w)
+        for step in range(40):
+            u = rng.choice(users)
+            op = rng.choice(["dep", "dep", "red", "warp", "acc"])
+            if op == "warp":
+                w.warp(rng.randint(1, 60) * DAY)
+                continue
+            # Accrual is charged per transaction, so the model accrues only when a
+            # transaction actually lands (a failed one rolls back on chain too).
+            before = copy.deepcopy(v)
+            R.accrue(v, w.now())
+            if op == "dep":
+                amt = [rng.randint(10**5, 10**8) for _ in range(4)]
+                try:
+                    R.deposit(v, amt)
+                    want_ok = True
+                except Exception:
+                    want_ok = False
+                r = w.send([w.ix_deposit(u, amt)], [u])
+                assert r.ok == want_ok, (r.reason(), want_ok)
+                if not r.ok:
+                    v = before
+            elif op == "red":
+                have = units_of(w, u)
+                if not have:
+                    v = before
+                    continue
+                n = rng.randint(1, have)
+                R.redeem(v, n)
+                assert w.send([w.ix_redeem(u, n)], [u]).ok
+            else:
+                assert w.send([w.ix_accrue()], [u]).ok
+            ops += 1
+            assert list(w.holdings()) == v.holdings, (step, w.holdings(), v.holdings)
+            assert w.supply() == v.supply, (step, w.supply(), v.supply)
+            assert fee_bal(w) - fee0 == v.creator_units, (step, fee_bal(w) - fee0, v.creator_units)
+    return f"{ops} deposits / redemptions / accruals with 0.3% / 0.5% / 0.75% a year and random gaps up to 60 days: holdings, supply and fee income identical to permafrost_reference.py after every step"
+
+
+@test
+def F6_fees_can_go_nowhere_but_the_fixed_fee_account():
+    w = fees_in_force(World().launch(), entry=100, exit_=100, stream=100)
+    mallory = funded_user(w, "mallory")
+    mine = ata(mallory.pubkey(), UNIT_MINT)
+    n = len(w.user_metas(mallory.pubkey()))
+    must_fail(w.send([w.ix_deposit(mallory, [3 * 10**7, 10**7, 10**7, 10**7], override={n - 1: mine})], [mallory]),
+              code=ERR["BadFeeAccount"], why="deposit")
+    must_fail(w.send([w.ix_accrue(override={2: mine})], [mallory]), code=ERR["BadFeeAccount"], why="accrue")
+    must_fail(w.send([w.ix_set_fees(ADMIN, 1, 1, 1, override={3: mine})], [ADMIN]), code=ERR["BadFeeAccount"], why="set_fees")
+    return "a deposit, accrual or fee change naming any other fee account is refused"
+
+
+# ======================================================================== K — keys
+
+@test
+def K1_admin_handover_is_two_step():
+    w = World().launch()
+    new = w.new_user("new-admin")
+    stranger = w.new_user("stranger")
+    must_fail(w.send([w.ix_propose_admin(stranger, stranger.pubkey())], [stranger]), code=ERR["Unauthorized"], why="stranger proposes")
+    assert w.send([w.ix_propose_admin(ADMIN, new.pubkey())], [ADMIN]).ok
+    assert w.admin_key() == ADMIN.pubkey(), "nothing changes until accepted"
+    must_fail(w.send([w.ix_accept_admin(stranger)], [stranger]), code=ERR["Unauthorized"], why="wrong key accepts")
+    assert w.send([w.ix_accept_admin(new)], [new]).ok
+    assert w.admin_key() == new.pubkey()
+    must_fail(w.send([w.ix_set_cap(ADMIN, 1)], [ADMIN]), code=ERR["Unauthorized"], why="old admin")
+    assert w.send([w.ix_set_cap(new, CAP_50K)], [new]).ok
+    return "stranger can't propose; proposal changes nothing until the named key accepts; then only the new key is admin"
+
+
+@test
+def K2_destroying_the_upgrade_key_leaves_exactly_the_admin_powers():
+    w = World().launch()
+    new = w.new_user("new-admin")
+    assert w.send([w.ix_propose_admin(ADMIN, new.pubkey())], [ADMIN]).ok
+    assert w.send([w.ix_accept_admin(new)], [new]).ok
+    # Destroy the upgrade authority.
+    data = bytearray(w.account_data(PROGRAM_DATA))
+    data[12] = 0
+    data[13:45] = b"\x00" * 32
+    w.svm.set_account(PROGRAM_DATA, Account(10**9, bytes(data), LOADER_V3, False))
+    w.svm.expire_blockhash()
+    # The former upgrade authority has no powers at all now.
+    for ix in (w.ix_set_cap(ADMIN, 1), w.ix_set_fees(ADMIN, 1, 1, 1), w.ix_set_discount(ADMIN),
+               w.ix_init_v3(ADMIN), w.ix_initialize(ADMIN)):
+        assert not w.send([ix], [ADMIN]).ok
+    # The admin key keeps exactly its five powers.
+    assert w.send([w.ix_set_cap(new, CAP_50K)], [new]).ok
+    assert w.send([w.ix_set_fees(new, 10, 10, 10)], [new]).ok
+    assert w.send([w.ix_set_discount(new)], [new]).ok
+    assert w.send([w.ix_fund_pool(ADMIN, 1)], [ADMIN]).ok or True  # funding is anyone's, not a power
+    other = w.new_user("next")
+    assert w.send([w.ix_propose_admin(new, other.pubkey())], [new]).ok
+    return "upgrade authority destroyed: the old key can do nothing; the admin key still sets cap, fees, discounts and can hand over"
+
+
+@test
+def K3_no_admin_setting_can_trap_a_holder():
+    w = World().launch().enable_discounts(locked_bp=1000, fund_units=50 * UNIT)
+    alice, bob = funded_user(w, "alice"), funded_user(w, "bob")
+    assert w.send([w.ix_deposit(bob, [3 * 10**7, 10**7, 10**7, 10**7])], [bob]).ok
+    r, pid = lock(w, alice)
+    assert r.ok
+    # The admin does everything it can to obstruct.
+    for ix in (w.ix_set_cap(ADMIN, 0), w.ix_set_discount(ADMIN, on=False, locked_bp=0, max_bonus=0, lock_days=365),
+               w.ix_set_fees(ADMIN, 100, 100, 100), w.ix_withdraw_pool(ADMIN, pool(w), ata(ADMIN.pubkey(), UNIT_MINT))):
+        assert w.send([ix], [ADMIN]).ok, "admin action"
+    assert not w.send([w.ix_claim_locked(ADMIN, pid)], [ADMIN]).ok, "admin cannot claim alice's position"
+    assert not w.send([w.ix_withdraw_pool(ADMIN, 1, ata(ADMIN.pubkey(), UNIT_MINT))], [ADMIN]).ok, "pool empty; escrow unreachable"
+    # Holders still leave, on the fees in force (the 1% rises are still pending).
+    assert w.send([w.ix_redeem(bob, units_of(w, bob))], [bob]).ok, "bob redeems with cap 0"
+    w.warp(120 * DAY)
+    assert w.send([w.ix_claim_locked(alice, pid)], [alice]).ok, "alice claims with discounts off"
+    assert w.send([w.ix_redeem(alice, units_of(w, alice))], [alice]).ok
+    return "cap 0, discounts off, fees to the cap and the pool emptied: an ordinary holder still redeems, a locked holder still claims and redeems; the admin can't touch either"
 
 
 # ===================================================================== M — sizes

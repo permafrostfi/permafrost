@@ -66,6 +66,9 @@ DEVNET_MINTS = [Pubkey.from_string(s) for s in (
 # CREATES with real Token-2022 instructions (tests/replica.py), instead of the
 # byte-copied mainnet mints. Same suite, both builds.
 DEVNET = os.environ.get("PF_DEVNET") == "1"
+# PF_V1=1: build instructions for the v1 program (admin = upgrade authority for
+# set_cap; no init_v3 at launch). Default on this branch: v3.
+V1_LAYOUT = os.environ.get("PF_V1") == "1"
 LEG_MINTS = DEVNET_MINTS if DEVNET else REAL_MINTS
 # The devnet build goes to its own folder so it can never be mistaken for the mainnet one.
 PROGRAM_SO = ROOT / "target" / ("deploy-devnet" if DEVNET else "deploy") / "permafrost.so"
@@ -117,6 +120,11 @@ ESCROW = pda([b"escrow"])
 DAY = 86_400
 
 
+# v3 — fees go to this fixed wallet's PAIF account (FEE_OWNER in lib.rs).
+FEE_OWNER = Pubkey.from_string("E3FTvAEzUU8v91cFCbykxQzcqRo7Zc2Jp3HxtwTZmYyt")
+FEE_ACCOUNT = ata(FEE_OWNER, UNIT_MINT)
+
+
 def position_pda(pid: int) -> Pubkey:
     return pda([b"position", struct.pack("<Q", pid)])
 
@@ -129,6 +137,8 @@ ERR = {n: 6000 + i for i, n in enumerate([
     "DiscountsNotReady", "DiscountsOff", "RateTooHigh", "LockOutOfRange",
     "LockLongerThanAccepted", "BonusBelowAccepted", "ZeroAmount", "BadAmount",
     "NotMatured", "AlreadyMatured", "NotPositionOwner",
+    # v3
+    "FeeTooHigh", "BadFeeAccount",
 ])}
 
 
@@ -369,15 +379,18 @@ class World:
         return Instruction(PROGRAM_ID, data, _apply(metas, override))
 
     def user_metas(self, user: Pubkey, user_unit=None):
+        # v3: the vault is written (fee clock) and the fee account comes last. A v1
+        # program ignores both differences, so the same builders serve v1 and v3.
         return [
             AccountMeta(user, True, False),
-            AccountMeta(VAULT, False, False),
+            AccountMeta(VAULT, False, True),
             AccountMeta(UNIT_MINT, False, True),
             AccountMeta(user_unit or ata(user, UNIT_MINT), False, True),
             *[AccountMeta(m, False, False) for m in LEG_MINTS],
             *[AccountMeta(v, False, True) for v in VAULT_LEGS],
             *[AccountMeta(ata(user, m), False, True) for m in LEG_MINTS],
             AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(FEE_ACCOUNT, False, True),
         ]
 
     def ix_deposit(self, user: Keypair, max_in, min_units_out=0, override=None) -> Instruction:
@@ -389,7 +402,10 @@ class World:
         return Instruction(PROGRAM_ID, data, _apply(self.user_metas(user.pubkey()), override))
 
     def ix_set_cap(self, admin: Keypair, new_cap, override=None) -> Instruction:
-        metas = self.admin_metas(admin.pubkey()) + [AccountMeta(VAULT, False, True)]
+        if V1_LAYOUT:
+            metas = self.admin_metas(admin.pubkey()) + [AccountMeta(VAULT, False, True)]
+        else:  # v3: the stored admin key; no program / program data accounts
+            metas = [AccountMeta(admin.pubkey(), True, False), AccountMeta(VAULT, False, True)]
         metas[0] = AccountMeta(admin.pubkey(), True, False)
         data = anchor_disc("set_cap") + struct.pack("<Q", new_cap)
         return Instruction(PROGRAM_ID, data, _apply(metas, override))
@@ -419,21 +435,52 @@ class World:
         self.svm.set_clock(c)
         self.svm.expire_blockhash()
 
-    def ix_init_discounts(self, admin: Keypair, override=None) -> Instruction:
+    def ix_init_v3(self, admin: Keypair, override=None) -> Instruction:
         metas = self.admin_metas(admin.pubkey()) + [
             AccountMeta(VAULT, False, True),
             AccountMeta(UNIT_MINT, False, False),
+            AccountMeta(FEE_OWNER, False, False),
+            AccountMeta(FEE_ACCOUNT, False, True),
             AccountMeta(POOL, False, True),
             AccountMeta(ESCROW, False, True),
             AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False),
             AccountMeta(SYSTEM, False, False),
         ]
-        return Instruction(PROGRAM_ID, anchor_disc("init_discounts"), _apply(metas, override))
+        return Instruction(PROGRAM_ID, anchor_disc("init_v3"), _apply(metas, override))
+
+    def ix_set_fees(self, admin: Keypair, entry_bp=0, exit_bp=0, stream_bp=0, override=None) -> Instruction:
+        metas = [AccountMeta(admin.pubkey(), True, False), AccountMeta(VAULT, False, True),
+                 AccountMeta(UNIT_MINT, False, True), AccountMeta(FEE_ACCOUNT, False, True),
+                 AccountMeta(TOKEN_2022, False, False)]
+        data = anchor_disc("set_fees") + struct.pack("<HHH", entry_bp, exit_bp, stream_bp)
+        return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    def ix_accrue(self, override=None) -> Instruction:
+        metas = [AccountMeta(VAULT, False, True), AccountMeta(UNIT_MINT, False, True),
+                 AccountMeta(FEE_ACCOUNT, False, True), AccountMeta(TOKEN_2022, False, False)]
+        return Instruction(PROGRAM_ID, anchor_disc("accrue"), _apply(metas, override))
+
+    def ix_propose_admin(self, admin: Keypair, new_admin: Pubkey) -> Instruction:
+        metas = [AccountMeta(admin.pubkey(), True, False), AccountMeta(VAULT, False, True)]
+        return Instruction(PROGRAM_ID, anchor_disc("propose_admin") + bytes(new_admin), metas)
+
+    def ix_accept_admin(self, new_admin: Keypair) -> Instruction:
+        metas = [AccountMeta(new_admin.pubkey(), True, False), AccountMeta(VAULT, False, True)]
+        return Instruction(PROGRAM_ID, anchor_disc("accept_admin"), metas)
+
+    def fees(self) -> dict:
+        d = self.account_data(VAULT)
+        o = 8 + 3 + 8 + 24 + 64
+        e, x, st, pe, px, ps, pat, last = struct.unpack_from("<HHHHHHqq", d, o)
+        return dict(entry=e, exit=x, stream=st, pending=(pe, px, ps), pending_at=pat, last_accrual=last)
+
+    def admin_key(self) -> Pubkey:
+        return Pubkey(self.account_data(VAULT)[8 + 3 + 8 + 24: 8 + 3 + 8 + 24 + 32])
 
     def ix_set_discount(self, admin: Keypair, on=True, locked_bp=1000, max_bonus=10 * UNIT,
                         lock_days=120, override=None) -> Instruction:
-        metas = self.admin_metas(admin.pubkey()) + [AccountMeta(VAULT, False, True)]
-        metas[0] = AccountMeta(admin.pubkey(), True, False)
+        metas = [AccountMeta(admin.pubkey(), True, False), AccountMeta(VAULT, False, True)]
         data = anchor_disc("set_discount") + struct.pack("<?HQH", on, locked_bp, max_bonus, lock_days)
         return Instruction(PROGRAM_ID, data, _apply(metas, override))
 
@@ -449,14 +496,14 @@ class World:
         return Instruction(PROGRAM_ID, anchor_disc("fund_pool") + struct.pack("<Q", amount), _apply(metas, override))
 
     def ix_withdraw_pool(self, admin: Keypair, amount: int, destination: Pubkey, override=None) -> Instruction:
-        metas = self.admin_metas(admin.pubkey()) + [
+        metas = [
+            AccountMeta(admin.pubkey(), True, False),
             AccountMeta(VAULT, False, False),
             AccountMeta(UNIT_MINT, False, False),
             AccountMeta(POOL, False, True),
             AccountMeta(destination, False, True),
             AccountMeta(TOKEN_2022, False, False),
         ]
-        metas[0] = AccountMeta(admin.pubkey(), True, False)
         return Instruction(PROGRAM_ID, anchor_disc("withdraw_pool") + struct.pack("<Q", amount), _apply(metas, override))
 
     def ix_deposit_locked(self, user: Keypair, max_in, min_units_out=0, max_lock_days=365,
@@ -475,6 +522,7 @@ class World:
             *[AccountMeta(ata(u, m), False, True) for m in LEG_MINTS],
             AccountMeta(TOKEN_2022, False, False),
             AccountMeta(SYSTEM, False, False),
+            AccountMeta(FEE_ACCOUNT, False, True),
         ]
         data = anchor_disc("deposit_locked") + struct.pack("<4QQHQ", *max_in, min_units_out, max_lock_days, min_bonus)
         return Instruction(PROGRAM_ID, data, _apply(metas, override))
@@ -499,9 +547,12 @@ class World:
     def ix_exit_locked(self, owner, pid, dest=None, override=None):
         return self._settle("exit_locked", owner, pid, dest, override)
 
+    def init_v3(self):
+        r = self.send([self.ix_init_v3(ADMIN)], [ADMIN])
+        assert r.ok, "init_v3: " + r.reason()
+        return self
+
     def enable_discounts(self, locked_bp=1000, max_bonus=10 * UNIT, lock_days=120, fund_units=0):
-        r = self.send([self.ix_init_discounts(ADMIN)], [ADMIN])
-        assert r.ok, "init_discounts: " + r.reason()
         r = self.send([self.ix_set_discount(ADMIN, True, locked_bp, max_bonus, lock_days)], [ADMIN])
         assert r.ok, "set_discount: " + r.reason()
         if fund_units:
@@ -516,14 +567,17 @@ class World:
         return self
 
     # ------------------------------------------------------------ fixtures
-    def launch(self, seed_amounts=None, cap=CAP_50K):
-        """Initialise + seed, as the mainnet launch would."""
+    def launch(self, seed_amounts=None, cap=CAP_50K, v3=None):
+        """Initialise + seed, as the mainnet launch would; then (v3 builds) init_v3."""
+        v3 = (not V1_LAYOUT) if v3 is None else v3
         seed_amounts = seed_amounts or SEED_AMOUNTS
         r = self.send([self.ix_initialize(ADMIN, cap)], [ADMIN])
         assert r.ok, "initialize: " + r.reason()
         self.mint_legs(ADMIN, seed_amounts)
         r = self.send([self.ix_seed(ADMIN, seed_amounts)], [ADMIN])
         assert r.ok, "seed: " + r.reason()
+        if v3:
+            self.init_v3()
         return self
 
 

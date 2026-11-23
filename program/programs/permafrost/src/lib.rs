@@ -18,6 +18,19 @@
 //! (instant) discount is deliberately absent — it is drainable by cycling
 //! (`permafrost-discount-mode.md`); the "we pay your entry costs" rebate lives
 //! off-chain at the relayer instead.
+//!
+//! v3 (23 Nov 2026) adds FEES and SPLITS THE KEYS. Admin powers move from the
+//! upgrade authority to an `admin` key stored in the vault, and that key can do
+//! exactly these things and nothing else:
+//!   1. set the deposit cap (`set_cap`)
+//!   2. set the locked bonus: on/off, rate, per-deposit max, lock 30–365 days
+//!      (`set_discount`)
+//!   3. withdraw UNUSED bonus-pool units (`withdraw_pool`)
+//!   4. set fees within the hard caps; increases wait FEE_TIMELOCK (`set_fees`)
+//!   5. hand the admin role to a new key, two-step (`propose_admin`/`accept_admin`)
+//! It can never move users' units or legs, block redemptions, change the basket,
+//! change the fee payee (FEE_OWNER, fixed below), freeze anyone, or mint units
+//! other than the fees. The upgrade authority is to be destroyed after v3.
 
 use anchor_lang::prelude::*;
 use anchor_lang::system_program;
@@ -94,6 +107,15 @@ pub const MIN_LOCK_DAYS: u16 = 30;
 pub const MAX_LOCK_DAYS: u16 = 365;
 pub const DAY: i64 = 86_400;
 
+// ------------------------------------------------------------- v3: fees
+/// Fees are paid, as units, to this wallet's PAIF account (its associated token
+/// account for the unit mint). Fixed in code (decided 23 Nov): no instruction can
+/// redirect fees.
+pub const FEE_OWNER: Pubkey = pubkey!("E3FTvAEzUU8v91cFCbykxQzcqRo7Zc2Jp3HxtwTZmYyt");
+/// Fee increases take effect only this long after they are set; decreases are
+/// immediate. Holders always get this much notice to leave at the old rate.
+pub const FEE_TIMELOCK: i64 = 30 * DAY;
+
 // ------------------------------------------------------------------- program
 
 #[program]
@@ -129,7 +151,17 @@ pub mod permafrost {
             v.next_position = 0;
             v.pool_bump = 0;
             v.escrow_bump = 0;
-            v.reserved = [0u8; 232];
+            v.admin = Pubkey::default();
+            v.pending_admin = Pubkey::default();
+            v.entry_bp = 0;
+            v.exit_bp = 0;
+            v.stream_bp = 0;
+            v.pending_entry_bp = 0;
+            v.pending_exit_bp = 0;
+            v.pending_stream_bp = 0;
+            v.pending_at = 0;
+            v.last_accrual = 0;
+            v.reserved = [0u8; 140];
         }
 
         // Token-2022 grows the mint account to hold the metadata and requires it to
@@ -223,8 +255,12 @@ pub mod permafrost {
 
     /// Offer up to `max_in` of each leg; receive at least `min_units_out` units or
     /// nothing happens. Only the proportional slice is taken (L5).
-    pub fn deposit(ctx: Context<Deposit>, max_in: [u64; 4], min_units_out: u64) -> Result<()> {
-        let a = &ctx.accounts;
+    pub fn deposit(mut ctx: Context<Deposit>, max_in: [u64; 4], min_units_out: u64) -> Result<()> {
+        let a = &mut ctx.accounts;
+        // v3: the management fee owed so far is charged first, so this deposit
+        // buys in at the post-fee value per unit.
+        let now = Clock::get()?.unix_timestamp;
+        let streamed = settle_fees(&mut a.vault, a.unit_mint.supply, now)?;
 
         // L1 — holdings and supply are READ from the chain, never stored.
         let holdings = [
@@ -233,13 +269,13 @@ pub mod permafrost {
             a.vault_leg2.amount,
             a.vault_leg3.amount,
         ];
-        let supply = a.unit_mint.supply;
+        let supply = a.unit_mint.supply.checked_add(streamed).ok_or(PfErr::Overflow)?;
 
-        // A fresh in-memory core vault: fees are zero in v1 (L7). Built, used,
-        // discarded — the core is never persisted.
+        // A fresh in-memory core vault. Built, used, discarded — the core is never
+        // persisted. v3: the entry fee is the core's `to_creator`.
         let mut v = pf::Vault::new(holdings.map(u128::from), supply as u128);
+        v.entry_bp = a.vault.entry_bp as u128;
         let out = pf::deposit(&mut v, max_in.map(u128::from)).map_err(core_err)?;
-        require!(out.to_creator == 0, PfErr::UnexpectedFee);
 
         // W2 — the cap. Deposits only; `redeem` never consults it.
         let after = (supply as u128)
@@ -285,6 +321,8 @@ pub mod permafrost {
             ),
             units,
         )?;
+        let fee = u64::try_from(out.to_creator).map_err(|_| PfErr::Overflow)?;
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, fee + streamed)?;
 
         emit!(Deposited {
             user: a.user.key(),
@@ -298,8 +336,10 @@ pub mod permafrost {
     /// Hand back `units_in`; receive your pro-rata share of each leg, at least
     /// `min_out` of each or nothing happens. No cap, no price, no other condition.
     /// All-or-nothing across the four legs (L8).
-    pub fn redeem(ctx: Context<Redeem>, units_in: u64, min_out: [u64; 4]) -> Result<()> {
-        let a = &ctx.accounts;
+    pub fn redeem(mut ctx: Context<Redeem>, units_in: u64, min_out: [u64; 4]) -> Result<()> {
+        let a = &mut ctx.accounts;
+        let now = Clock::get()?.unix_timestamp;
+        let streamed = settle_fees(&mut a.vault, a.unit_mint.supply, now)?;
 
         let holdings = [
             a.vault_leg0.amount,
@@ -307,11 +347,15 @@ pub mod permafrost {
             a.vault_leg2.amount,
             a.vault_leg3.amount,
         ];
-        let supply = a.unit_mint.supply;
+        let supply = a.unit_mint.supply.checked_add(streamed).ok_or(PfErr::Overflow)?;
 
+        // v3: the exit fee is a slice of the units handed back, transferred to the
+        // fee account instead of burnt; the payout is computed on what is burnt.
         let mut v = pf::Vault::new(holdings.map(u128::from), supply as u128);
+        v.exit_bp = a.vault.exit_bp as u128;
         let r = pf::redeem(&mut v, units_in as u128).map_err(core_err)?;
-        require!(r.to_creator == 0, PfErr::UnexpectedFee);
+        let burned = u64::try_from(r.burned).map_err(|_| PfErr::Overflow)?;
+        let fee = u64::try_from(r.to_creator).map_err(|_| PfErr::Overflow)?;
 
         let mut paid = [0u64; 4];
         for i in 0..4 {
@@ -329,8 +373,21 @@ pub mod permafrost {
                     authority: a.user.to_account_info(),
                 },
             ),
-            units_in,
+            burned,
         )?;
+        if fee > 0 {
+            transfer(
+                &a.token_program,
+                a.user_unit.to_account_info(),
+                a.unit_mint.to_account_info(),
+                a.fee_account.to_account_info(),
+                a.user.to_account_info(),
+                fee,
+                UNIT_DECIMALS,
+                None,
+            )?;
+        }
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, streamed)?;
 
         let bump = [a.vault.vault_bump];
         let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, &bump]];
@@ -356,7 +413,7 @@ pub mod permafrost {
             user: a.user.key(),
             units: units_in,
             paid,
-            supply_after: supply - units_in,
+            supply_after: supply - burned,
         });
         Ok(())
     }
@@ -372,16 +429,107 @@ pub mod permafrost {
 
     // =============================================================== v2
 
-    /// Create the bonus pool and the escrow (token accounts of the unit mint owned
-    /// by the vault PDA). Upgrade authority only; once (the `init`s fail after).
-    pub fn init_discounts(ctx: Context<InitDiscounts>) -> Result<()> {
+    /// One-time switch to v3: create the bonus pool and the escrow, make sure the
+    /// fee account exists, and hand the admin role to the signer. Upgrade
+    /// authority only — the LAST thing the upgrade authority ever does.
+    pub fn init_v3(ctx: Context<InitV3>) -> Result<()> {
+        // The fee account is FEE_OWNER's ordinary PAIF account; create it if needed.
+        anchor_spl::associated_token::create_idempotent(CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            anchor_spl::associated_token::Create {
+                payer: ctx.accounts.admin.to_account_info(),
+                associated_token: ctx.accounts.fee_account.to_account_info(),
+                authority: ctx.accounts.fee_owner.to_account_info(),
+                mint: ctx.accounts.unit_mint.to_account_info(),
+                system_program: ctx.accounts.system_program.to_account_info(),
+                token_program: ctx.accounts.token_program.to_account_info(),
+            },
+        ))?;
+        let now = Clock::get()?.unix_timestamp;
         let v = &mut ctx.accounts.vault;
         v.discounts_ready = true;
         v.pool_bump = ctx.bumps.pool;
         v.escrow_bump = ctx.bumps.escrow;
         v.lock_days = 120; // DS3 default; discounts stay OFF until set_discount
-        v.version = 2;
-        emit!(DiscountsInitialized {});
+        v.admin = ctx.accounts.admin.key();
+        v.last_accrual = now; // fees start at zero; nothing is owed for the past
+        v.version = 3;
+        emit!(V3Initialized { admin: v.admin });
+        Ok(())
+    }
+
+    /// Admin power 4. Fees within the hard caps. A decrease applies now; an
+    /// increase applies FEE_TIMELOCK after this call. Setting again replaces any
+    /// pending change (and restarts the clock for increases). The management fee
+    /// owed so far is charged at the old rate first.
+    pub fn set_fees(mut ctx: Context<SetFees>, entry_bp: u16, exit_bp: u16, stream_bp: u16) -> Result<()> {
+        require!(
+            entry_bp as u128 <= pf::MAX_ENTRY_BP
+                && exit_bp as u128 <= pf::MAX_EXIT_BP
+                && stream_bp as u128 <= pf::MAX_STREAM_BP,
+            PfErr::FeeTooHigh
+        );
+        let a = &mut ctx.accounts;
+        let now = Clock::get()?.unix_timestamp;
+        let supply = a.unit_mint.supply;
+        let minted = settle_fees(&mut a.vault, supply, now)?;
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, minted)?;
+
+        let v = &mut a.vault;
+        let increase = entry_bp > v.entry_bp || exit_bp > v.exit_bp || stream_bp > v.stream_bp;
+        // Every component that goes down applies immediately.
+        v.entry_bp = v.entry_bp.min(entry_bp);
+        v.exit_bp = v.exit_bp.min(exit_bp);
+        v.stream_bp = v.stream_bp.min(stream_bp);
+        if increase {
+            v.pending_entry_bp = entry_bp;
+            v.pending_exit_bp = exit_bp;
+            v.pending_stream_bp = stream_bp;
+            v.pending_at = now.checked_add(FEE_TIMELOCK).ok_or(PfErr::Overflow)?;
+        } else {
+            v.pending_entry_bp = 0;
+            v.pending_exit_bp = 0;
+            v.pending_stream_bp = 0;
+            v.pending_at = 0;
+        }
+        emit!(FeesSet {
+            entry_bp: v.entry_bp,
+            exit_bp: v.exit_bp,
+            stream_bp: v.stream_bp,
+            pending_entry_bp: v.pending_entry_bp,
+            pending_exit_bp: v.pending_exit_bp,
+            pending_stream_bp: v.pending_stream_bp,
+            pending_at: v.pending_at,
+        });
+        Ok(())
+    }
+
+    /// Anyone may charge the management fee owed so far (and bring pending fees
+    /// into force once due). Deposits and redemptions do this automatically.
+    pub fn accrue(mut ctx: Context<Accrue>) -> Result<()> {
+        let a = &mut ctx.accounts;
+        let now = Clock::get()?.unix_timestamp;
+        let supply = a.unit_mint.supply;
+        let minted = settle_fees(&mut a.vault, supply, now)?;
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, minted)?;
+        Ok(())
+    }
+
+    /// Admin power 5, step 1: name a successor. Nothing changes until they accept.
+    pub fn propose_admin(ctx: Context<AdminOnly>, new_admin: Pubkey) -> Result<()> {
+        ctx.accounts.vault.pending_admin = new_admin;
+        emit!(AdminProposed { current: ctx.accounts.admin.key(), proposed: new_admin });
+        Ok(())
+    }
+
+    /// Admin power 5, step 2: the successor signs to take over. A typo in step 1
+    /// therefore can never hand the role to a key nobody holds.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let v = &mut ctx.accounts.vault;
+        let old = v.admin;
+        v.admin = ctx.accounts.new_admin.key();
+        v.pending_admin = Pubkey::default();
+        emit!(AdminChanged { old, new: v.admin });
         Ok(())
     }
 
@@ -464,6 +612,8 @@ pub mod permafrost {
         let a = &mut ctx.accounts;
         require!(a.vault.discount_on, PfErr::DiscountsOff);
         require!(a.vault.lock_days <= max_lock_days, PfErr::LockLongerThanAccepted);
+        let now = Clock::get()?.unix_timestamp;
+        let streamed = settle_fees(&mut a.vault, a.unit_mint.supply, now)?;
 
         let holdings = [
             a.vault_leg0.amount,
@@ -471,17 +621,18 @@ pub mod permafrost {
             a.vault_leg2.amount,
             a.vault_leg3.amount,
         ];
-        let supply = a.unit_mint.supply;
+        let supply = a.unit_mint.supply.checked_add(streamed).ok_or(PfErr::Overflow)?;
 
-        // The core's own arithmetic: deposit, then the bonus with its three
-        // ceilings (rate, per-deposit max, what the pool actually holds).
+        // The core's own arithmetic: deposit (entry fee included), then the bonus
+        // with its three ceilings (rate, per-deposit max, what the pool holds).
+        // The bonus is figured on the depositor's own units, after the fee.
         let mut v = pf::Vault::new(holdings.map(u128::from), supply as u128);
+        v.entry_bp = a.vault.entry_bp as u128;
         v.discount_on = true;
         v.locked_discount_bp = a.vault.locked_bp as u128;
         v.max_bonus_units = a.vault.max_bonus as u128;
         v.subsidy_units = a.pool.amount as u128;
         let out = pf::deposit(&mut v, max_in.map(u128::from)).map_err(core_err)?;
-        require!(out.to_creator == 0, PfErr::UnexpectedFee);
         let bonus = pf::bonus_for(&v, out.to_depositor, v.locked_discount_bp).map_err(core_err)?;
 
         // The cap counts minted units only; the bonus is a transfer.
@@ -540,7 +691,9 @@ pub mod permafrost {
             )?;
         }
 
-        let now = Clock::get()?.unix_timestamp;
+        let fee = u64::try_from(out.to_creator).map_err(|_| PfErr::Overflow)?;
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, fee + streamed)?;
+
         let unlock_at = now
             .checked_add(a.vault.lock_days as i64 * DAY)
             .ok_or(PfErr::Overflow)?;
@@ -650,6 +803,75 @@ fn transfer<'info>(
     token_interface::transfer_checked(ctx, amount, decimals)
 }
 
+/// Charge the management fee owed up to `now`, bringing pending fees into force at
+/// exactly their effective time (the old rate up to it, the new rate after).
+/// Returns the units owed to the fee account; the caller mints them.
+fn settle_fees(v: &mut VaultState, supply: u64, now: i64) -> Result<u64> {
+    let mut s = supply as u128;
+    let mut minted: u128 = 0;
+    if v.pending_at != 0 && now >= v.pending_at {
+        let t = v.pending_at;
+        let m = accrue_to(v, s, t)?;
+        s += m;
+        minted += m;
+        v.entry_bp = v.pending_entry_bp;
+        v.exit_bp = v.pending_exit_bp;
+        v.stream_bp = v.pending_stream_bp;
+        v.pending_entry_bp = 0;
+        v.pending_exit_bp = 0;
+        v.pending_stream_bp = 0;
+        v.pending_at = 0;
+        emit!(FeesApplied { entry_bp: v.entry_bp, exit_bp: v.exit_bp, stream_bp: v.stream_bp, at: t });
+    }
+    minted += accrue_to(v, s, now)?;
+    Ok(u64::try_from(minted).map_err(|_| PfErr::Overflow)?)
+}
+
+/// The core's `accrue` (m = S·f/(1−f), f = stream_bp·elapsed/(BP·YEAR)).
+fn accrue_to(v: &mut VaultState, supply: u128, t: i64) -> Result<u128> {
+    let mut c = pf::Vault::new([1; 4], supply);
+    c.stream_bp = v.stream_bp as u128;
+    c.last_accrual = v.last_accrual;
+    let m = pf::accrue(&mut c, t).map_err(core_err)?;
+    v.last_accrual = c.last_accrual;
+    Ok(m)
+}
+
+fn mint_fees<'info>(
+    token_program: &Program<'info, Token2022>,
+    unit_mint: &InterfaceAccount<'info, Mint>,
+    fee_account: &InterfaceAccount<'info, TokenAccount>,
+    vault: &Account<'info, VaultState>,
+    amount: u64,
+) -> Result<()> {
+    if amount == 0 {
+        return Ok(());
+    }
+    let bump = [vault.vault_bump];
+    let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, &bump]];
+    token_interface::mint_to(
+        CpiContext::new_with_signer(
+            token_program.to_account_info(),
+            MintTo {
+                mint: unit_mint.to_account_info(),
+                to: fee_account.to_account_info(),
+                authority: vault.to_account_info(),
+            },
+            seeds,
+        ),
+        amount,
+    )
+}
+
+/// FEE_OWNER's associated PAIF account — the only account fees can go to.
+pub fn fee_account_address(unit_mint: &Pubkey) -> Pubkey {
+    anchor_spl::associated_token::get_associated_token_address_with_program_id(
+        &FEE_OWNER,
+        unit_mint,
+        &anchor_spl::token_2022::ID,
+    )
+}
+
 fn core_err(e: pf::PfError) -> Error {
     match e {
         pf::PfError::UnseededVault => PfErr::CoreUnseeded,
@@ -674,7 +896,7 @@ pub struct VaultState {
     pub cap: u64,
     // ---- v2. Carved out of v1's 256 reserved bytes (24 used), so a v1 vault
     // account decodes unchanged: every v2 field reads zero = discounts off.
-    /// Pool and escrow accounts exist (set by `init_discounts`).
+    /// Pool and escrow accounts exist (set by `init_v3`).
     pub discounts_ready: bool,
     pub discount_on: bool,
     /// Bonus as a share of the units the deposit mints, ≤ 10,000 bp (100%).
@@ -687,8 +909,25 @@ pub struct VaultState {
     pub next_position: u64,
     pub pool_bump: u8,
     pub escrow_bump: u8,
-    /// Space for fee and rebalance state in later upgrades.
-    pub reserved: [u8; 232],
+    // ---- v3. Also carved from the reserved bytes (92 used).
+    /// The admin key (v3). Default (all zero) until `init_v3`.
+    pub admin: Pubkey,
+    /// A proposed new admin, waiting to accept. Default = none.
+    pub pending_admin: Pubkey,
+    /// Fees in force, in basis points. Entry and exit ≤ 100; stream ≤ 100 per year.
+    pub entry_bp: u16,
+    pub exit_bp: u16,
+    pub stream_bp: u16,
+    /// Fees set but not yet in force (an increase waiting out the timelock).
+    pub pending_entry_bp: u16,
+    pub pending_exit_bp: u16,
+    pub pending_stream_bp: u16,
+    /// When the pending fees take effect; 0 = nothing pending.
+    pub pending_at: i64,
+    /// The management fee has been charged up to this time.
+    pub last_accrual: i64,
+    /// Space for rebalance state in later versions.
+    pub reserved: [u8; 140],
 }
 
 #[account]
@@ -841,7 +1080,7 @@ pub struct Seed<'info> {
 pub struct Deposit<'info> {
     pub user: Signer<'info>,
 
-    #[account(seeds = [VAULT_SEED], bump = vault.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump)]
     pub vault: Box<Account<'info, VaultState>>,
     #[account(mut, seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
     pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -884,13 +1123,16 @@ pub struct Deposit<'info> {
     pub user_leg3: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token2022>,
+    /// v3 — fees (entry fee, management fee) go here and nowhere else.
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 #[derive(Accounts)]
 pub struct Redeem<'info> {
     pub user: Signer<'info>,
 
-    #[account(seeds = [VAULT_SEED], bump = vault.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump)]
     pub vault: Box<Account<'info, VaultState>>,
     #[account(mut, seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
     pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -934,25 +1176,22 @@ pub struct Redeem<'info> {
     pub user_leg3: Box<InterfaceAccount<'info, TokenAccount>>,
 
     pub token_program: Program<'info, Token2022>,
+    /// v3 — fees (entry fee, management fee) go here and nowhere else.
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 #[derive(Accounts)]
 pub struct SetCap<'info> {
     pub admin: Signer<'info>,
-    pub program: Program<'info, crate::program::Permafrost>,
-    #[account(
-        constraint = program.programdata_address()? == Some(program_data.key()) @ PfErr::Unauthorized,
-        constraint = program_data.upgrade_authority_address == Some(admin.key()) @ PfErr::Unauthorized,
-    )]
-    pub program_data: Account<'info, ProgramData>,
-    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump, constraint = vault.admin == admin.key() @ PfErr::Unauthorized)]
     pub vault: Box<Account<'info, VaultState>>,
 }
 
 // -------------------------------------------------------- v2 accounts
 
 #[derive(Accounts)]
-pub struct InitDiscounts<'info> {
+pub struct InitV3<'info> {
     #[account(mut)]
     pub admin: Signer<'info>,
     pub program: Program<'info, crate::program::Permafrost>,
@@ -965,6 +1204,12 @@ pub struct InitDiscounts<'info> {
     pub vault: Box<Account<'info, VaultState>>,
     #[account(seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
     pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CHECK: the fixed fee owner; only used to create its PAIF account.
+    #[account(address = FEE_OWNER)]
+    pub fee_owner: UncheckedAccount<'info>,
+    /// CHECK: FEE_OWNER's PAIF account, created here if missing (idempotent).
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: UncheckedAccount<'info>,
     #[account(init, payer = admin, seeds = [POOL_SEED], bump,
         token::mint = unit_mint, token::authority = vault, token::token_program = token_program)]
     pub pool: Box<InterfaceAccount<'info, TokenAccount>>,
@@ -972,19 +1217,14 @@ pub struct InitDiscounts<'info> {
         token::mint = unit_mint, token::authority = vault, token::token_program = token_program)]
     pub escrow: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Program<'info, Token2022>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
     pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
 pub struct SetDiscount<'info> {
     pub admin: Signer<'info>,
-    pub program: Program<'info, crate::program::Permafrost>,
-    #[account(
-        constraint = program.programdata_address()? == Some(program_data.key()) @ PfErr::Unauthorized,
-        constraint = program_data.upgrade_authority_address == Some(admin.key()) @ PfErr::Unauthorized,
-    )]
-    pub program_data: Account<'info, ProgramData>,
-    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump)]
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump, constraint = vault.admin == admin.key() @ PfErr::Unauthorized)]
     pub vault: Box<Account<'info, VaultState>>,
 }
 
@@ -1006,13 +1246,7 @@ pub struct FundPool<'info> {
 #[derive(Accounts)]
 pub struct WithdrawPool<'info> {
     pub admin: Signer<'info>,
-    pub program: Program<'info, crate::program::Permafrost>,
-    #[account(
-        constraint = program.programdata_address()? == Some(program_data.key()) @ PfErr::Unauthorized,
-        constraint = program_data.upgrade_authority_address == Some(admin.key()) @ PfErr::Unauthorized,
-    )]
-    pub program_data: Account<'info, ProgramData>,
-    #[account(seeds = [VAULT_SEED], bump = vault.vault_bump, constraint = vault.discounts_ready @ PfErr::DiscountsNotReady)]
+    #[account(seeds = [VAULT_SEED], bump = vault.vault_bump, constraint = vault.admin == admin.key() @ PfErr::Unauthorized, constraint = vault.discounts_ready @ PfErr::DiscountsNotReady)]
     pub vault: Box<Account<'info, VaultState>>,
     #[account(seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
     pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
@@ -1079,6 +1313,9 @@ pub struct DepositLocked<'info> {
 
     pub token_program: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
+    /// v3 — fees (entry fee, management fee) go here and nowhere else.
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: Box<InterfaceAccount<'info, TokenAccount>>,
 }
 
 /// Claim (at/after maturity) or exit (before). Only the position's owner signs;
@@ -1102,6 +1339,47 @@ pub struct SettlePosition<'info> {
         constraint = owner_unit.owner != vault.key() @ PfErr::BadAccount)]
     pub owner_unit: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct SetFees<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump,
+        constraint = vault.admin == admin.key() @ PfErr::Unauthorized)]
+    pub vault: Box<Account<'info, VaultState>>,
+    #[account(mut, seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
+    pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct Accrue<'info> {
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump)]
+    pub vault: Box<Account<'info, VaultState>>,
+    #[account(mut, seeds = [UNIT_MINT_SEED], bump = vault.unit_mint_bump)]
+    pub unit_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, address = fee_account_address(&unit_mint.key()) @ PfErr::BadFeeAccount)]
+    pub fee_account: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub token_program: Program<'info, Token2022>,
+}
+
+#[derive(Accounts)]
+pub struct AdminOnly<'info> {
+    pub admin: Signer<'info>,
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump,
+        constraint = vault.admin == admin.key() @ PfErr::Unauthorized)]
+    pub vault: Box<Account<'info, VaultState>>,
+}
+
+#[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    pub new_admin: Signer<'info>,
+    #[account(mut, seeds = [VAULT_SEED], bump = vault.vault_bump,
+        constraint = vault.pending_admin != Pubkey::default() @ PfErr::Unauthorized,
+        constraint = vault.pending_admin == new_admin.key() @ PfErr::Unauthorized)]
+    pub vault: Box<Account<'info, VaultState>>,
 }
 
 // ------------------------------------------------------------------- events
@@ -1140,7 +1418,40 @@ pub struct CapSet {
 }
 
 #[event]
-pub struct DiscountsInitialized {}
+pub struct V3Initialized {
+    pub admin: Pubkey,
+}
+
+#[event]
+pub struct FeesSet {
+    pub entry_bp: u16,
+    pub exit_bp: u16,
+    pub stream_bp: u16,
+    pub pending_entry_bp: u16,
+    pub pending_exit_bp: u16,
+    pub pending_stream_bp: u16,
+    pub pending_at: i64,
+}
+
+#[event]
+pub struct FeesApplied {
+    pub entry_bp: u16,
+    pub exit_bp: u16,
+    pub stream_bp: u16,
+    pub at: i64,
+}
+
+#[event]
+pub struct AdminProposed {
+    pub current: Pubkey,
+    pub proposed: Pubkey,
+}
+
+#[event]
+pub struct AdminChanged {
+    pub old: Pubkey,
+    pub new: Pubkey,
+}
 
 #[event]
 pub struct DiscountSet {
@@ -1225,7 +1536,7 @@ pub enum PfErr {
     #[msg("core: arithmetic error")]
     CoreArithmetic,
     // ---- v2 (appended: v1 codes keep their numbers)
-    #[msg("discounts have not been set up (init_discounts)")]
+    #[msg("discounts have not been set up (init_v3)")]
     DiscountsNotReady,
     #[msg("locked deposits are switched off")]
     DiscountsOff,
@@ -1247,4 +1558,9 @@ pub enum PfErr {
     AlreadyMatured,
     #[msg("signer does not own this position")]
     NotPositionOwner,
+    // ---- v3 (appended)
+    #[msg("fee above its hard cap (entry 1%, exit 1%, management 1% a year)")]
+    FeeTooHigh,
+    #[msg("fees can only go to FEE_OWNER's PAIF account")]
+    BadFeeAccount,
 }
