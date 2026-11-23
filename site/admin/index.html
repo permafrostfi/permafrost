@@ -59,6 +59,8 @@ table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:ta
 th,td{text-align:left;padding:6px 8px;border-bottom:1px solid var(--line)} th{color:var(--muted);font-weight:500}
 td.num,th.num{text-align:right}
 .tablewrap{overflow-x:auto}
+h2.section{font:600 .8rem/1.2 var(--body);letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin:12px 0 -6px}
+select{font:14px var(--body);padding:8px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 </style>
 </head>
@@ -67,7 +69,7 @@ td.num,th.num{text-align:right}
   <header>
     <div style="display:grid;gap:4px">
       <h1>Permafrost Admin</h1>
-      <p class="muted">Set up the vault, seed it, change the deposit cap, apply upgrades. Every action is simulated first; nothing is sent until you approve it in Phantom.</p>
+      <p class="muted">Launch the vault, then run its five admin powers: deposit cap, locked bonus, bonus pool, fees, admin handover. Every action is simulated first; nothing is sent until you approve it in Phantom.</p>
     </div>
     <div class="seg" role="group" aria-label="Network">
       <button id="net-devnet" type="button" aria-pressed="true">Devnet</button>
@@ -98,6 +100,8 @@ td.num,th.num{text-align:right}
     <p class="muted" style="font-size:13px">Token amounts are raw balances divided by 10⁸. Phantom shows xStocks multiplied by the issuer's dividend factor, so its figures run slightly higher.</p>
   </section>
 
+  <h2 class="section">Launch <span class="muted">· upgrade key, once each</span></h2>
+
   <section class="panel" id="card-init">
     <div class="actionhead"><h2>1. Set up the vault</h2><span id="st-init" class="pill muted">—</span></div>
     <p class="muted">Creates the vault, the PAIF token and the five token accounts. Once only. The name and symbol cannot be changed afterwards.</p>
@@ -118,17 +122,77 @@ td.num,th.num{text-align:right}
     <div class="out" id="out-seed"></div>
   </section>
 
+  <section class="panel" id="card-v3">
+    <div class="actionhead"><h2>3. Switch on bonus, fees and the admin key</h2><span id="st-v3" class="pill muted">—</span></div>
+    <p class="muted">Creates the bonus pool, the escrow for locked deposits and the fee account, and makes your wallet the admin key. Bonus and fees start off. Once only, and the last thing the upgrade key needs to do.</p>
+    <div class="row"><button id="do-v3" type="button">Simulate switch-on</button></div>
+    <div class="out" id="out-v3"></div>
+  </section>
+
+  <h2 class="section">Admin powers <span class="muted">· the complete list</span></h2>
+
   <section class="panel" id="card-cap">
-    <div class="actionhead"><h2>3. Change the deposit cap</h2><span id="st-cap" class="pill muted">—</span></div>
+    <div class="actionhead"><h2>Power 1 · Deposit cap</h2><span id="st-cap" class="pill muted">—</span></div>
     <p class="muted">Deposits that would take total supply above the cap are refused. Redemptions are never capped.</p>
     <div class="grid"><label for="cap-new">New cap (units)<input id="cap-new" inputmode="numeric" placeholder="50000"></label></div>
     <div class="row"><button id="do-cap" type="button">Simulate cap change</button></div>
     <div class="out" id="out-cap"></div>
   </section>
 
+  <section class="panel" id="card-disc">
+    <div class="actionhead"><h2>Power 2 · Locked bonus</h2><span id="st-disc" class="pill muted">—</span></div>
+    <p class="muted">Depositors who lock their units for the lock period get this bonus from the pool. Changes apply to new locks only; open locks keep their terms.</p>
+    <div class="grid">
+      <label for="disc-on">Locked deposits<select id="disc-on"><option value="1">On</option><option value="0">Off</option></select></label>
+      <label for="disc-rate">Bonus (% of units deposited)<input id="disc-rate" inputmode="decimal" placeholder="10"></label>
+      <label for="disc-max">Largest bonus per deposit (units)<input id="disc-max" inputmode="decimal" placeholder="25"></label>
+      <label for="disc-days">Lock period (30–365 days)<input id="disc-days" inputmode="numeric" placeholder="120"></label>
+    </div>
+    <div class="row"><button id="do-disc" type="button">Simulate bonus settings</button></div>
+    <div class="out" id="out-disc"></div>
+  </section>
+
+  <section class="panel" id="card-pool">
+    <div class="actionhead"><h2>Power 3 · Bonus pool</h2><span id="st-pool" class="pill muted">—</span></div>
+    <p class="muted">Anyone can top the pool up with PAIF from the connected wallet. Only the admin can withdraw, and only unused units: units promised to open locks are out of reach.</p>
+    <div class="grid">
+      <label for="pool-in">Top up (PAIF units)<input id="pool-in" inputmode="decimal" placeholder="10"></label>
+    </div>
+    <div class="row"><button id="do-fund" type="button" class="ghost">Simulate top-up</button></div>
+    <div class="out" id="out-fund"></div>
+    <div class="grid">
+      <label for="pool-out">Withdraw (PAIF units)<input id="pool-out" inputmode="decimal" placeholder="10"></label>
+      <label for="pool-to">Send to wallet address<input id="pool-to" spellcheck="false" autocomplete="off" placeholder="your wallet if empty"></label>
+    </div>
+    <div class="row"><button id="do-pool" type="button">Simulate withdrawal</button></div>
+    <div class="out" id="out-pool"></div>
+  </section>
+
+  <section class="panel" id="card-fees">
+    <div class="actionhead"><h2>Power 4 · Fees</h2><span id="st-fees" class="pill muted">—</span></div>
+    <p class="muted">Caps: entry 1%, exit 1%, management 1% a year. A cut applies at once; a rise takes effect 30 days after you set it. Setting again replaces any pending change. Fees are paid as PAIF to your wallet's fixed fee account.</p>
+    <div class="grid">
+      <label for="fee-entry">Entry fee (%)<input id="fee-entry" inputmode="decimal" placeholder="0.3"></label>
+      <label for="fee-exit">Exit fee (%)<input id="fee-exit" inputmode="decimal" placeholder="0.5"></label>
+      <label for="fee-stream">Management fee (% a year)<input id="fee-stream" inputmode="decimal" placeholder="0.75"></label>
+    </div>
+    <div class="row"><button id="do-fees" type="button">Simulate fee change</button></div>
+    <div class="out" id="out-fees"></div>
+  </section>
+
+  <section class="panel" id="card-admin">
+    <div class="actionhead"><h2>Power 5 · Hand over the admin key</h2><span id="st-admin" class="pill muted">—</span></div>
+    <p class="muted">Two steps. The admin names a new key; nothing changes until that key connects here and accepts. A typo can never hand the role to a key nobody holds.</p>
+    <div class="grid"><label for="admin-new">New admin wallet address<input id="admin-new" spellcheck="false" autocomplete="off"></label></div>
+    <div class="row"><button id="do-propose" type="button">Simulate proposal</button><button id="do-accept" type="button" class="ghost">Accept the admin role</button></div>
+    <div class="out" id="out-admin"></div>
+  </section>
+
+  <h2 class="section">Code <span class="muted">· upgrade key</span></h2>
+
   <section class="panel" id="card-upg">
-    <div class="actionhead"><h2>4. Apply an upgrade</h2><span id="st-upg" class="pill muted">—</span></div>
-    <p class="muted">Claude uploads new program code to a buffer and hands the buffer to your address. Paste the buffer address here; the page checks it before you sign. The buffer's rent comes back to your wallet.</p>
+    <div class="actionhead"><h2>Apply an upgrade</h2><span id="st-upg" class="pill muted">—</span></div>
+    <p class="muted">Claude uploads new program code to a buffer and hands the buffer to your address. Paste the buffer address here; the page checks it before you sign. The buffer's rent comes back to your wallet. The upgrade key is to be destroyed later, once v3 has run live for a while.</p>
     <div class="grid"><label for="upg-buffer">Buffer address<input id="upg-buffer" spellcheck="false" autocomplete="off"></label></div>
     <div class="row"><button id="do-upg" type="button">Simulate upgrade</button></div>
     <div class="out" id="out-upg"></div>
@@ -160,14 +224,28 @@ const NETWORKS = {
             "XspzcW1PRtgf6Wj92HCiZdjzKCyFekVD8P5Ueh3dRMX","Xsa62P5mvPszXL1krVUnU5ar38bBSVcWAB6fmPCo5Zu"],
   },
 };
-const DISC = { initialize:[175,175,109,31,13,152,155,237], seed:[255,178,140,239,113,22,214,231], set_cap:[209,207,121,129,115,39,220,4] };
+const DISC = {
+  initialize:[175,175,109,31,13,152,155,237], seed:[255,178,140,239,113,22,214,231], set_cap:[209,207,121,129,115,39,220,4],
+  init_v3:[212,143,186,208,34,121,217,189], set_discount:[185,99,11,85,175,2,42,198], fund_pool:[36,57,233,176,181,20,87,159],
+  withdraw_pool:[190,43,148,248,68,5,215,136], set_fees:[137,178,49,58,0,245,242,190],
+  propose_admin:[121,214,199,212,87,39,117,234], accept_admin:[112,42,45,90,116,181,13,170],
+};
+// Fixed in the program (FEE_OWNER): fees go to this wallet's PAIF account, nowhere else.
+const FEE_OWNER = PK("E3FTvAEzUU8v91cFCbykxQzcqRo7Zc2Jp3HxtwTZmYyt");
+const ZERO = new W.PublicKey(new Uint8Array(32));
 const VAULT_DISC = [228,196,82,165,98,210,235,152];
-const UNIT = 1_000_000_000n, LEG_DEC = 8;
+const UNIT = 1_000_000_000n, LEG_DEC = 8, UNIT_DEC = 9;
 const MAX_CAP_UNITS = 50_000n; // E1: not above 50,000 until custody improves
 
 // ---------------------------------------------------------------- small helpers
 const $ = id => document.getElementById(id);
 const store = { get(k){try{return localStorage.getItem(k)}catch{return null}}, set(k,v){try{localStorage.setItem(k,v)}catch{}} };
+const u16 = v => { const b = new Uint8Array(2); new DataView(b.buffer).setUint16(0, Number(v), true); return b; };
+const readU16 = (d,o) => new DataView(d.buffer,d.byteOffset,d.byteLength).getUint16(o,true);
+const readI64 = (d,o) => Number(new DataView(d.buffer,d.byteOffset,d.byteLength).getBigInt64(o,true));
+const pct = bp => (bp/100).toLocaleString("en-US",{maximumFractionDigits:2}) + "%";
+const toBp = (txt, label) => { const t = String(txt).trim(); if(!/^\d+(\.\d{1,2})?$/.test(t)) throw new Error(`${label}: enter a percentage like 0.5`); return Math.round(parseFloat(t)*100); };
+const when = ts => new Date(ts*1000).toUTCString().replace(" GMT"," UTC");
 const u64 = v => { const b = new Uint8Array(8); new DataView(b.buffer).setBigUint64(0, BigInt(v), true); return b; };
 const str = s => { const e = new TextEncoder().encode(s); const b = new Uint8Array(4+e.length); new DataView(b.buffer).setUint32(0,e.length,true); b.set(e,4); return b; };
 const cat = (...a) => { const n=a.reduce((s,x)=>s+x.length,0), o=new Uint8Array(n); let i=0; for(const x of a){o.set(x,i);i+=x.length} return o; };
@@ -179,6 +257,8 @@ const explorer = (sig, net) => `https://solscan.io/tx/${sig}${net.cluster?"?clus
 
 // ---------------------------------------------------------------- state
 let netKey = "devnet", net, conn, A = null, wallet = null, chain = {};
+const ALL_OUT = ["init","seed","v3","cap","disc","fund","pool","fees","admin","upg"];
+const ALL_ST = ["init","seed","v3","cap","disc","pool","fees","admin","upg"];
 function provider(){ return (window.phantom && window.phantom.solana) || (window.solana && window.solana.isPhantom ? window.solana : null); }
 
 function derive(n){
@@ -191,6 +271,8 @@ function derive(n){
   const deadOwner = pda([new TextEncoder().encode("dead")]);
   const mints = n.mints.map(PK);
   return { program, ata, vault, unitMint, deadOwner, deadUnits: ata(deadOwner, unitMint), mints,
+    pool: pda([new TextEncoder().encode("pool")]), escrow: pda([new TextEncoder().encode("escrow")]),
+    feeAccount: ata(FEE_OWNER, unitMint),
     vaultLegs: mints.map(m => ata(vault, m)),
     programData: W.PublicKey.findProgramAddressSync([program.toBuffer()], LOADER_V3)[0] };
 }
@@ -201,7 +283,7 @@ function selectNet(k){
   $("rpc").value = store.get("pf-rpc-"+k) || net.rpc;
   $("rpc").placeholder = k==="mainnet" ? "https://mainnet.helius-rpc.com/?api-key=…" : net.rpc;
   A = derive(net);
-  for (const id of ["init","seed","cap","upg"]) $("out-"+id).innerHTML = "";
+  for (const id of ALL_OUT) $("out-"+id).innerHTML = "";
   renderSeedInputs();
   refresh();
 }
@@ -217,13 +299,16 @@ async function refresh(){
   conn = new W.Connection(rpc, "confirmed");
   L.innerHTML = `<dt>State</dt><dd class="muted">Reading…</dd>`;
   try{
-    const keys = [A.programData, A.vault, A.unitMint, A.deadUnits, ...A.vaultLegs];
-    if(wallet) keys.push(wallet, ...A.mints.map(m => A.ata(wallet, m)));
+    const keys = [A.programData, A.vault, A.unitMint, A.deadUnits, A.pool, A.escrow, A.feeAccount, ...A.vaultLegs];
+    if(wallet) keys.push(wallet, ...A.mints.map(m => A.ata(wallet, m)), A.ata(wallet, A.unitMint));
     const accs = await conn.getMultipleAccountsInfo(keys);
     if(seq !== refreshSeq) return;
-    const [pd, v, um, du, ...rest] = accs;
+    const [pd, v, um, du, pl, es, fa, ...rest] = accs;
     const vl = rest.slice(0,4), w = wallet ? rest[4] : null, wl = wallet ? rest.slice(5,9) : [null,null,null,null];
+    const wu = wallet ? rest[9] : null;
     const bal = a => a ? readU64(a.data, 64) : 0n;
+    const d = v ? v.data : null;
+    const v3 = !!d && d[19] === 1;  // discounts_ready: init_v3 has run
     chain = {
       deployed: !!pd,
       authority: pd && pd.data[12] === 1 ? new W.PublicKey(pd.data.slice(13,45)) : null,
@@ -234,15 +319,34 @@ async function refresh(){
       holdings: vl.map(bal),
       walletLegs: wl.map(bal),
       sol: w ? w.lamports : 0,
+      walletUnits: bal(wu),
+      v3,
+      pool: bal(pl), escrow: bal(es), feeUnits: bal(fa),
+      discOn: v3 && d[20] === 1, lockedBp: v3 ? readU16(d,21) : 0, lockDays: v3 ? readU16(d,23) : 0,
+      maxBonus: v3 ? readU64(d,25) : 0n, positions: v3 ? readU64(d,33) : 0n,
+      admin: v3 ? new W.PublicKey(d.slice(43,75)) : null,
+      pendingAdmin: v3 ? new W.PublicKey(d.slice(75,107)) : null,
+      fees: v3 ? { entry: readU16(d,107), exit: readU16(d,109), stream: readU16(d,111),
+                   pending: [readU16(d,113), readU16(d,115), readU16(d,117)], pendingAt: readI64(d,119) } : null,
     };
-    const isAdmin = wallet && chain.authority && chain.authority.equals(wallet);
+    const isUpg = wallet && chain.authority && chain.authority.equals(wallet);
+    const isAdm = wallet && chain.admin && chain.admin.equals(wallet);
     const rows = [
       ["Program", `<span class="mono">${A.program.toBase58()}</span> ${chain.deployed?'<span class="pill ok">deployed</span>':'<span class="pill bad">not found</span>'}`],
-      ["Upgrade authority", chain.authority ? `<span class="mono">${chain.authority.toBase58()}</span> ${wallet ? (isAdmin?'<span class="pill ok">this is you</span>':'<span class="pill bad">not your wallet</span>') : ''}` : (chain.deployed?'<span class="pill bad">none: program is immutable</span>':'—')],
+      ["Upgrade key", chain.authority ? `<span class="mono">${chain.authority.toBase58()}</span> ${wallet ? (isUpg?'<span class="pill ok">this is you</span>':'<span class="pill muted">not your wallet</span>') : ''}` : (chain.deployed?'<span class="pill ok">destroyed: the code can never change</span>':'—')],
+      ["Admin key", !chain.vault ? '—' : chain.v3 ? `<span class="mono">${chain.admin.toBase58()}</span> ${wallet ? (isAdm?'<span class="pill ok">this is you</span>':'<span class="pill muted">not your wallet</span>') : ''}${chain.pendingAdmin.equals(ZERO) ? '' : ` · proposed successor <span class="mono">${chain.pendingAdmin.toBase58()}</span>`}` : '<span class="pill warn">not switched on (step 3)</span>'],
       ["Vault", chain.vault ? `<span class="pill ok">set up</span> cap ${fmt(chain.cap,9)} units` : '<span class="pill warn">not set up</span>'],
       ["PAIF supply", chain.vault ? `${fmt(chain.supply,9)} units, of which ${fmt(chain.dead,9)} locked forever` : '—'],
     ];
-    if(wallet) rows.push(["Your SOL", (chain.sol/1e9).toLocaleString("en-US",{maximumFractionDigits:4})]);
+    if(chain.v3){
+      const f = chain.fees;
+      rows.push(["Fees in force", `entry ${pct(f.entry)} · exit ${pct(f.exit)} · management ${pct(f.stream)} a year`]);
+      if(f.pendingAt) rows.push(["Fee change pending", `entry ${pct(f.pending[0])} · exit ${pct(f.pending[1])} · management ${pct(f.pending[2])} a year, <b>from ${when(f.pendingAt)}</b>`]);
+      rows.push(["Locked bonus", chain.discOn ? `<span class="pill ok">on</span> ${pct(chain.lockedBp)} bonus, at most ${fmt(chain.maxBonus,9)} units per deposit, ${chain.lockDays}-day lock` : `<span class="pill muted">off</span> (lock period set to ${chain.lockDays} days)`]);
+      rows.push(["Bonus pool", `${fmt(chain.pool,9)} units free · ${fmt(chain.escrow,9)} units held for ${chain.positions.toString()} lock(s) ever opened`]);
+      rows.push(["Fee account", `<span class="mono">${A.feeAccount.toBase58()}</span> · ${fmt(chain.feeUnits,9)} units`]);
+    }
+    if(wallet) rows.push(["Your wallet", `${(chain.sol/1e9).toLocaleString("en-US",{maximumFractionDigits:4})} SOL · ${fmt(chain.walletUnits,9)} PAIF`]);
     L.innerHTML = rows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
     T.querySelector("tbody").innerHTML = LEGS.map((l,i) => `<tr><td>${l}</td><td class="mono">${A.mints[i].toBase58().slice(0,6)}…</td><td class="num">${fmt(chain.holdings[i],LEG_DEC)}</td><td class="num">${wallet?fmt(chain.walletLegs[i],LEG_DEC):"—"}</td></tr>`).join("");
     T.hidden = false;
@@ -254,15 +358,28 @@ async function refresh(){
 }
 
 function gate(){
-  const isAdmin = !!(wallet && chain.authority && chain.authority.equals(wallet));
-  const set = (id, on, label, cls) => { $("do-"+id).disabled = !on; const s=$("st-"+id); s.textContent=label; s.className="pill "+cls; };
-  if(!A || !chain.deployed){ for(const id of ["init","seed","cap","upg"]) set(id,false,"unavailable","muted"); return; }
-  if(!wallet){ for(const id of ["init","seed","cap","upg"]) set(id,false,"connect first","muted"); return; }
-  if(!isAdmin){ for(const id of ["init","seed","cap","upg"]) set(id,false,"not admin","bad"); return; }
-  set("init", !chain.vault, chain.vault ? "done" : "ready", chain.vault ? "ok" : "warn");
-  set("seed", chain.vault && chain.supply === 0n, !chain.vault ? "after set-up" : chain.supply>0n ? "done" : "ready", chain.supply>0n ? "ok" : chain.vault ? "warn" : "muted");
-  set("cap", chain.vault, chain.vault ? "available" : "after set-up", chain.vault ? "ok" : "muted");
-  set("upg", true, "available", "ok");
+  const isUpg = !!(wallet && chain.authority && chain.authority.equals(wallet));
+  const isAdm = !!(wallet && chain.admin && chain.admin.equals(wallet));
+  const ST = { propose: "admin", accept: "admin", fund: "pool" };  // buttons that share a card's status pill
+  const set = (id, on, label, cls) => { const b=$("do-"+id); if(b) b.disabled = !on; if(!label) return; const s=$("st-"+(ST[id]||id)); if(s){ s.textContent=label; s.className="pill "+cls; } };
+  const offAll = (label, cls) => { for(const id of ["init","seed","v3","cap","disc","fund","pool","fees","propose","accept","upg"]) set(id,false,label,cls); };
+  if(!A || !chain.deployed){ offAll("unavailable","muted"); return; }
+  if(!wallet){ offAll("connect first","muted"); return; }
+  // Launch steps — upgrade key, once each.
+  if(!isUpg){ set("init",false,"upgrade key only","muted"); set("seed",false,"upgrade key only","muted"); set("v3",false,"upgrade key only","muted"); set("upg",false,"upgrade key only","muted"); }
+  else {
+    set("init", !chain.vault, chain.vault ? "done" : "ready", chain.vault ? "ok" : "warn");
+    set("seed", chain.vault && chain.supply === 0n, !chain.vault ? "after set-up" : chain.supply>0n ? "done" : "ready", chain.supply>0n ? "ok" : chain.vault ? "warn" : "muted");
+    set("v3", chain.vault && chain.supply>0n && !chain.v3, chain.v3 ? "done" : chain.supply>0n ? "ready" : "after seed", chain.v3 ? "ok" : chain.supply>0n ? "warn" : "muted");
+    set("upg", true, "available", "ok");
+  }
+  // Admin powers — the stored admin key.
+  const adm = (id, label) => set(id, chain.v3 && isAdm, !chain.v3 ? "after step 3" : isAdm ? label : "admin key only", !chain.v3 ? "muted" : isAdm ? "ok" : "muted");
+  adm("cap","available"); adm("disc", chain.discOn ? "on" : "off"); adm("pool","available"); adm("fees", chain.v3 && chain.fees.pendingAt ? "change pending" : "available"); adm("propose","available");
+  set("fund", chain.v3 && chain.walletUnits > 0n, "", "muted");
+  const isNext = !!(wallet && chain.v3 && !chain.pendingAdmin.equals(ZERO) && chain.pendingAdmin.equals(wallet));
+  $("do-accept").disabled = !isNext;
+  if(isNext){ const s=$("st-admin"); s.textContent="you can accept"; s.className="pill warn"; }
 }
 
 function renderSeedInputs(){
@@ -290,8 +407,47 @@ function ixSeed(amounts){
   return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(data) });
 }
 function ixSetCap(capUnits){
-  const keys = [...adminMetas(false), meta(A.vault,false,true)];
+  const keys = [meta(wallet,true,false), meta(A.vault,false,true)];
   return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.set_cap), u64(capUnits*UNIT))) });
+}
+function ixInitV3(){
+  const keys = [...adminMetas(true), meta(A.vault,false,true), meta(A.unitMint,false,false),
+    meta(FEE_OWNER,false,false), meta(A.feeAccount,false,true), meta(A.pool,false,true), meta(A.escrow,false,true),
+    meta(TOKEN_2022,false,false), meta(ATA_PROGRAM,false,false), meta(W.SystemProgram.programId,false,false)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(Uint8Array.from(DISC.init_v3)) });
+}
+function ixSetDiscount(on, bp, maxBonus, days){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,true)];
+  const data = cat(Uint8Array.from(DISC.set_discount), Uint8Array.from([on?1:0]), u16(bp), u64(maxBonus), u16(days));
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(data) });
+}
+function ixFundPool(amount){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,false), meta(A.unitMint,false,false),
+    meta(A.ata(wallet, A.unitMint),false,true), meta(A.pool,false,true), meta(TOKEN_2022,false,false)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.fund_pool), u64(amount))) });
+}
+function ixCreateAta(owner, mint){  // idempotent: does nothing if the account exists
+  const keys = [meta(wallet,true,true), meta(A.ata(owner, mint),false,true), meta(owner,false,false), meta(mint,false,false),
+    meta(W.SystemProgram.programId,false,false), meta(TOKEN_2022,false,false)];
+  return new W.TransactionInstruction({ programId: ATA_PROGRAM, keys, data: toBuf(Uint8Array.from([1])) });
+}
+function ixWithdrawPool(amount, toOwner){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,false), meta(A.unitMint,false,false),
+    meta(A.pool,false,true), meta(A.ata(toOwner, A.unitMint),false,true), meta(TOKEN_2022,false,false)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.withdraw_pool), u64(amount))) });
+}
+function ixSetFees(e, x, st){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,true), meta(A.unitMint,false,true),
+    meta(A.feeAccount,false,true), meta(TOKEN_2022,false,false)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.set_fees), u16(e), u16(x), u16(st))) });
+}
+function ixProposeAdmin(next){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,true)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(cat(Uint8Array.from(DISC.propose_admin), next.toBytes())) });
+}
+function ixAcceptAdmin(){
+  const keys = [meta(wallet,true,false), meta(A.vault,false,true)];
+  return new W.TransactionInstruction({ programId: A.program, keys, data: toBuf(Uint8Array.from(DISC.accept_admin)) });
 }
 function ixUpgrade(buffer){
   const keys = [meta(A.programData,false,true), meta(A.program,false,true), meta(buffer,false,true), meta(wallet,false,true),
@@ -301,12 +457,13 @@ function ixUpgrade(buffer){
 function toBuf(u8){ return (typeof Buffer !== "undefined") ? Buffer.from(u8) : u8; }
 
 // ---------------------------------------------------------------- simulate → confirm → sign
-async function run(kind, build, summary){
-  const out = $("out-"+kind);
+async function run(kind, build, summary, outId){
+  const out = $("out-"+(outId||kind));
   out.innerHTML = `<p class="muted">Simulating…</p>`;
   let ixs;
   try{ ixs = build(); }catch(e){ out.innerHTML = `<p class="bad">${esc(e.message||e)}</p>`; return; }
   const cu = kind === "init" ? 300_000 : 200_000;
+  if(!conn){ out.innerHTML = `<p class="bad">Not connected to the network yet.</p>`; return; }
   const make = async () => {
     const tx = new W.Transaction().add(W.ComputeBudgetProgram.setComputeUnitLimit({ units: cu }), ...ixs);
     tx.feePayer = wallet;
@@ -345,7 +502,11 @@ async function run(kind, build, summary){
   }catch(e){ out.innerHTML = `<p class="bad">Could not simulate: ${esc(e.message||e)}</p>`; }
 }
 
-const PF_ERRORS = ["Unauthorized: this wallet is not the upgrade authority","Already seeded","Deposit cap exceeded","Slippage (units)","Slippage (leg)","Wrong account passed","Name, symbol or link too long","Overflow","Unexpected fee","Vault not seeded","A leg is empty","Amount too small (dust)","Bad redemption","Bad seed: every leg must be above zero","Arithmetic error"];
+const PF_ERRORS = ["Unauthorized: this wallet doesn't hold the key this action needs","Already seeded","Deposit cap exceeded","Slippage (units)","Slippage (leg)","Wrong account passed","Name, symbol or link too long","Overflow","Unexpected fee","Vault not seeded","A leg is empty","Amount too small (dust)","Bad redemption","Bad seed: every leg must be above zero","Arithmetic error",
+  "Bonus, fees and admin key not switched on yet (step 3)","Locked deposits are switched off","Bonus above 100%","Lock period must be 30 to 365 days",
+  "The lock period is longer than the depositor accepted","The bonus is smaller than the depositor accepted","Amount must be above zero",
+  "Amount is zero or more than the pool holds","The lock has not ended yet","The lock has ended: claim it instead","Not this position's owner",
+  "Fee above its cap (entry 1%, exit 1%, management 1% a year)","Fees can only go to the fixed fee account"];
 function explainErr(err, logs){
   const m = JSON.stringify(err).match(/"Custom":(\d+)/);
   if(m){ const c = +m[1]; if(c>=6000 && c<6000+PF_ERRORS.length) return PF_ERRORS[c-6000]+"."; return "Program error "+c+"."; }
@@ -374,6 +535,67 @@ $("do-cap").onclick = () => run("cap", () => {
   if(cap > MAX_CAP_UNITS) throw new Error("Agreed: no cap above 50,000 units until custody improves.");
   return [ixSetCap(cap)];
 }, `This changes the deposit cap to ${Number(($("cap-new").value||"0").replace(/,/g,"")).toLocaleString("en-US")} units.`);
+$("do-v3").onclick = () => run("v3", () => [ixInitV3()],
+  `This creates the bonus pool, the escrow and the fee account, and makes <span class="mono">${wallet ? wallet.toBase58() : ""}</span> the admin key. Bonus and fees stay off until you set them.`);
+
+$("do-disc").onclick = () => {
+  let on, bp, maxBonus, days;
+  try{
+    on = $("disc-on").value === "1";
+    bp = toBp($("disc-rate").value || "0", "Bonus");
+    if(bp > 10000) throw new Error("The bonus can be at most 100%.");
+    maxBonus = parseDec($("disc-max").value || "0", UNIT_DEC);
+    days = parseInt($("disc-days").value || "120", 10);
+    if(!(days >= 30 && days <= 365)) throw new Error("The lock period must be 30 to 365 days.");
+  }catch(e){ $("out-disc").innerHTML = `<p class="bad">${esc(e.message)}</p>`; return; }
+  run("disc", () => [ixSetDiscount(on, bp, maxBonus, days)],
+    on ? `Locked deposits <b>on</b>: ${pct(bp)} bonus, at most ${fmt(maxBonus,9)} units per deposit, ${days}-day lock. Applies to new locks only.`
+       : `Locked deposits <b>off</b>. Open locks are unaffected and can still be claimed or exited.`);
+};
+
+$("do-fund").onclick = () => {
+  let amt;
+  try{ amt = parseDec($("pool-in").value, UNIT_DEC); if(amt===0n) throw new Error("Enter an amount above zero."); if(amt > chain.walletUnits) throw new Error("Your wallet holds less PAIF than that."); }
+  catch(e){ $("out-fund").innerHTML = `<p class="bad">${esc(e.message)}</p>`; return; }
+  run("fund", () => [ixFundPool(amt)], `This moves ${fmt(amt,9)} PAIF from your wallet into the bonus pool.`);
+};
+
+$("do-pool").onclick = () => {
+  let amt, to;
+  try{
+    amt = parseDec($("pool-out").value, UNIT_DEC);
+    if(amt===0n) throw new Error("Enter an amount above zero.");
+    if(amt > chain.pool) throw new Error(`The pool holds only ${fmt(chain.pool,9)} free units.`);
+    to = $("pool-to").value.trim() ? PK($("pool-to").value.trim()) : wallet;
+  }catch(e){ $("out-pool").innerHTML = `<p class="bad">${esc(/Invalid public key/i.test(e.message) ? "That wallet address is not valid." : e.message)}</p>`; return; }
+  run("pool", () => [ixCreateAta(to, A.unitMint), ixWithdrawPool(amt, to)],
+    `This sends ${fmt(amt,9)} unused pool units to <span class="mono">${to.toBase58()}</span>${to.equals(wallet) ? " (your wallet)" : ""}. Units held for open locks are not touched.`);
+};
+
+$("do-fees").onclick = () => {
+  let e, x, st;
+  try{
+    e = toBp($("fee-entry").value || "0", "Entry fee"); x = toBp($("fee-exit").value || "0", "Exit fee"); st = toBp($("fee-stream").value || "0", "Management fee");
+    if(e > 100 || x > 100 || st > 100) throw new Error("Each fee is capped at 1% (management: 1% a year).");
+  }catch(err){ $("out-fees").innerHTML = `<p class="bad">${esc(err.message)}</p>`; return; }
+  const f = chain.fees, rise = e > f.entry || x > f.exit || st > f.stream;
+  const at = Math.floor(Date.now()/1000) + 30*86400;
+  run("fees", () => [ixSetFees(e, x, st)],
+    `New fees: entry ${pct(e)}, exit ${pct(x)}, management ${pct(st)} a year. ` +
+    (rise ? `Cuts apply now; the rise takes effect on about <b>${when(at)}</b> (30 days). Any earlier pending change is replaced.`
+          : `All apply now, and any pending rise is cancelled.`));
+};
+
+$("do-propose").onclick = () => {
+  let next;
+  try{ next = PK($("admin-new").value.trim()); if(next.equals(wallet)) throw new Error("That is already the admin key."); }
+  catch(e){ $("out-admin").innerHTML = `<p class="bad">${esc(/Invalid public key|non-base58|length/i.test(e.message) ? "That wallet address is not valid." : e.message)}</p>`; return; }
+  run("propose", () => [ixProposeAdmin(next)],
+    `This names <span class="mono">${next.toBase58()}</span> as the next admin. Nothing changes until that wallet connects here and accepts.`, "admin");
+};
+$("do-accept").onclick = () => run("accept", () => [ixAcceptAdmin()],
+  `This makes your wallet <span class="mono">${wallet.toBase58()}</span> the admin key. The current admin loses all admin powers.`, "admin");
+
 $("do-upg").onclick = async () => {
   const out = $("out-upg");
   let buf;

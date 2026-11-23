@@ -2,7 +2,8 @@
 
     PF_DEVNET=1 python3 -I tests/devnet.py replicas   # create the 4 replica mints
     (deploy with `solana program deploy`, see the launch checklist)
-    PF_DEVNET=1 python3 -I tests/devnet.py e2e        # initialize, seed, deposit, redeem, set_cap
+    PF_DEVNET=1 python3 -I tests/devnet.py e2e        # initialize, seed, init_v3, deposit, redeem, set_cap
+    PF_DEVNET=1 python3 -I tests/devnet.py user       # against someone else's vault: deposit, redeem, lock, exit
     PF_DEVNET=1 python3 -I tests/devnet.py handoff <new-authority>   # rehearse the key handoff
     PF_DEVNET=1 python3 -I tests/devnet.py fund <owner> [sol]        # give a wallet replica tokens
     PF_DEVNET=1 python3 -I tests/devnet.py status
@@ -180,6 +181,8 @@ def cmd_e2e():
         send([W.ix_seed(me, H.SEED_AMOUNTS)], [me], label="seed")
     else:
         print("  · already seeded")
+    if data(H.VAULT)[19] == 0:
+        send([W.ix_init_v3(me)], [me], label="init_v3 (pool, escrow, fee account, admin = deployer)")
     assert balance(H.DEAD_UNITS) == H.SEED_UNITS, "seed units not at the dead-units account"
     assert data(H.DEAD_OWNER) is None, "dead owner PDA should hold no account"
     print(f"  seed units at the never-signing PDA: {balance(H.DEAD_UNITS):,}")
@@ -226,6 +229,34 @@ def cmd_e2e():
     print("e2e OK")
 
 
+def cmd_user():
+    """What a depositor does, against a vault someone else administers (the rehearsal)."""
+    me = DEPLOYER
+    alice = Keypair.from_seed(bytes(32 * [8]))  # devnet-only throwaway
+    if (account(alice.pubkey()) or (0,))[0] < 30_000_000:
+        send([transfer(TransferParams(from_pubkey=me.pubkey(), to_pubkey=alice.pubkey(),
+                                      lamports=60_000_000))], [me], label="fund user 0.06 SOL")
+    give = [3 * x for x in H.SEED_AMOUNTS]
+    send(mint_to_ixs(alice.pubkey(), give, me.pubkey()), [me], label="mint replica legs to user")
+    send([W.create_ata_ix(alice.pubkey(), alice.pubkey(), H.UNIT_MINT), W.ix_deposit(alice, give, 1)],
+         [alice], label="user deposits")
+    got = units_of(alice.pubkey())
+    a1 = legs_of(alice.pubkey())
+    send([W.ix_redeem(alice, got // 2)], [alice], label="user redeems half")
+    print(f"  got {got:,} units; half back as {[b - a for a, b in zip(a1, legs_of(alice.pubkey()))]}")
+    d = data(H.VAULT)
+    if d[20] == 1:  # locked deposits on
+        nxt = struct.unpack_from("<Q", d, 33)[0]
+        send([W.ix_deposit_locked(alice, [x // 3 for x in give], 1, 365, 0, pid=nxt)], [alice], label="user locks")
+        pos = data(H.position_pda(nxt))
+        principal, bonus = struct.unpack_from("<QQ", pos, 8 + 8 + 32)
+        print(f"  locked {principal:,} units with a {bonus:,} bonus")
+        send([W.ix_exit_locked(alice, nxt)], [alice], label="user exits early (principal back, bonus to pool)")
+    else:
+        print("  locked deposits are off — skipped the lock")
+    print("user flow OK")
+
+
 def cmd_handoff(new_authority: str):
     """After `solana program set-upgrade-authority`, confirm the admin check followed."""
     pd = data(H.PROGRAM_DATA)
@@ -261,5 +292,5 @@ def cmd_status():
 
 if __name__ == "__main__":
     cmd, *args = sys.argv[1:] or ["status"]
-    {"replicas": cmd_replicas, "e2e": cmd_e2e, "handoff": cmd_handoff,
+    {"replicas": cmd_replicas, "e2e": cmd_e2e, "user": cmd_user, "handoff": cmd_handoff,
      "fund": cmd_fund, "status": cmd_status}[cmd](*args)
