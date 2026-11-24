@@ -1,0 +1,5 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Marks site/js as ES modules for Node (tools/verify_chain.mjs). The site itself has no build step."
+}
