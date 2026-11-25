@@ -10,7 +10,7 @@ devnet program id with the admin keypair as upgrade authority, and replica legs
 minted to the admin (tests/devnet.py fund, twice).
 
     python3 -m http.server 8077 -d site &      # from the repo root
-    PF_DEVNET=1 PF_RPC=http://localhost:8899 python3 -I site/admin/test_admin_page.py ADMIN.json NEXT.json
+    PF_DEVNET=1 PF_RPC=http://localhost:8899 python3 -I site/ops-cebeb3e05a/test_admin_page.py ADMIN.json NEXT.json
 """
 
 import base64
@@ -28,7 +28,7 @@ import harness as H  # noqa: E402
 
 admin = Keypair.from_bytes(bytes(json.load(open(sys.argv[1]))))
 nxt = Keypair.from_bytes(bytes(json.load(open(sys.argv[2]))))
-URL = "http://localhost:8077/admin/"
+URL = "http://localhost:8077/ops-cebeb3e05a/"
 RPC = os.environ["PF_RPC"]
 
 MOCK = """

@@ -1,0 +1,242 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Permafrost AI Fund</title>
+<meta name="description" content="Invest in an on-chain basket of Nvidia, Alphabet, Microsoft and Meta with USDC or USDT.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&family=Space+Grotesk:wght@500;600&display=swap">
+<style>
+/* Working invest / withdraw page for the MVP. The designed site (the design
+   session's port) replaces the look; the flows below stay. */
+:root{
+  --bg:#eef2f5; --panel:#ffffff; --fg:#13202a; --muted:#56687a; --line:#d3dce4;
+  --accent:#1f6f9a; --accent-ink:#ffffff; --ok:#17784a; --warn:#946200; --bad:#b42318;
+  --display:"Space Grotesk",system-ui,sans-serif; --body:"IBM Plex Sans",system-ui,sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,Menlo,monospace; color-scheme:light;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --bg:#0c1319; --panel:#121c24; --fg:#e2eaf0; --muted:#8fa2b2; --line:#24323d;
+  --accent:#6cb6de; --accent-ink:#06121a; --ok:#5ccf92; --warn:#e2b84a; --bad:#ff8b80; color-scheme:dark}}
+:root[data-theme="dark"]{--bg:#0c1319; --panel:#121c24; --fg:#e2eaf0; --muted:#8fa2b2; --line:#24323d;
+  --accent:#6cb6de; --accent-ink:#06121a; --ok:#5ccf92; --warn:#e2b84a; --bad:#ff8b80; color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 var(--body);
+  padding-left:max(16px,env(safe-area-inset-left,0px));padding-right:max(16px,env(safe-area-inset-right,0px));padding-block:28px 64px}
+main{max-width:720px;margin:0 auto;display:grid;gap:18px}
+h1{font:600 1.6rem/1.2 var(--display);margin:0} h2{font:600 1.05rem/1.3 var(--display);margin:0}
+p{margin:0} .muted{color:var(--muted)} .mono{font-family:var(--mono);font-size:13px;word-break:break-all}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:18px;display:grid;gap:12px;min-width:0}
+.row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.figs{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px}
+.fig{display:grid;gap:2px}.fig b{font:600 1.15rem var(--display);font-variant-numeric:tabular-nums}.fig span{font-size:12px;color:var(--muted)}
+button{font:500 14px var(--body);padding:10px 16px;border-radius:8px;border:1px solid var(--accent);background:var(--accent);color:var(--accent-ink);cursor:pointer}
+button.ghost{background:transparent;color:var(--accent)} button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+label{display:grid;gap:4px;font-size:13px;color:var(--muted)}
+input,select{font:15px var(--mono);padding:9px 10px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%}
+.two{display:grid;grid-template-columns:2fr 1fr;gap:10px}
+.tabs{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.tabs button{border:0;border-radius:0;background:transparent;color:var(--muted)} .tabs button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
+.out{display:grid;gap:8px} .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+.confirm{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:8px}
+table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums} td,th{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left} td.num,th.num{text-align:right}
+.note{font-size:13px;color:var(--muted)}
+</style>
+</head>
+<body>
+<main>
+  <header class="row" style="justify-content:space-between">
+    <div style="display:grid;gap:4px"><h1>Permafrost AI Fund</h1>
+      <p class="muted">Nvidia, Alphabet, Microsoft and Meta in one token (PAIF). Invest and withdraw in USDC or USDT.</p></div>
+    <button id="connect" type="button">Connect Phantom</button>
+  </header>
+
+  <section class="panel" aria-labelledby="fund-h">
+    <h2 id="fund-h">The fund</h2>
+    <div class="figs" id="figs"><div class="fig"><b>…</b><span>loading</span></div></div>
+    <p class="note" id="warn"></p>
+  </section>
+
+  <section class="panel" aria-labelledby="act-h">
+    <div class="row" style="justify-content:space-between">
+      <h2 id="act-h">Your money</h2>
+      <div class="tabs" role="group" aria-label="Action">
+        <button id="tab-invest" type="button" aria-pressed="true">Invest</button>
+        <button id="tab-withdraw" type="button" aria-pressed="false">Withdraw</button>
+      </div>
+    </div>
+    <p class="mono muted" id="who">Not connected.</p>
+    <div id="mine" class="figs" hidden></div>
+
+    <div id="pane-invest" class="out">
+      <div class="two">
+        <label for="inv-amt">Amount<input id="inv-amt" inputmode="decimal" placeholder="100" autocomplete="off"></label>
+        <label for="inv-coin">Pay with<select id="inv-coin"><option>USDC</option><option>USDT</option></select></label>
+      </div>
+      <div class="row"><button id="do-invest" type="button" disabled>Review investment</button></div>
+      <div class="out" id="out-invest"></div>
+    </div>
+
+    <div id="pane-withdraw" class="out" hidden>
+      <div class="two">
+        <label for="wd-amt">PAIF to withdraw<input id="wd-amt" inputmode="decimal" placeholder="10" autocomplete="off"></label>
+        <label for="wd-coin">Receive<select id="wd-coin"><option>USDC</option><option>USDT</option></select></label>
+      </div>
+      <div class="row"><button id="do-withdraw" type="button" disabled>Review withdrawal</button><button id="wd-max" type="button" class="ghost" disabled>All my PAIF</button></div>
+      <div class="out" id="out-withdraw"></div>
+    </div>
+  </section>
+
+  <p class="note">Unaudited software. The four stock tokens are issued by Backed, which can freeze, pause or take them, and a pause of any one stops all withdrawals. Your wallet signs every step; network fees are paid for you and repaid in USDC/USDT inside the same transactions.</p>
+</main>
+
+<script src="../js/vendor/web3-1.98.0.iife.min.js"></script>
+<script type="module">
+import { Rpc, readFund, readHolder, value, jupiterPrices } from '../js/chain.js';
+import { makeRouter, STABLES } from '../js/router.js';
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const usd = (n) => '$' + Number(n).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const toBase = (txt, dec) => {
+  const t = String(txt).trim().replace(/,/g, '');
+  if (!/^\d+(\.\d+)?$/.test(t)) throw new Error('Enter a number, e.g. 100');
+  const [i, f = ''] = t.split('.');
+  return BigInt(i) * 10n ** BigInt(dec) + BigInt((f + '0'.repeat(dec)).slice(0, dec));
+};
+const RPC_URL = '/api/rpc';
+const rpc = new Rpc(RPC_URL);
+let addresses, router, relayInfo, wallet = null, fund = null, holder = null, priced = null;
+
+function provider() { return (window.phantom && window.phantom.solana) || null; }
+
+async function load() {
+  try {
+    addresses = await (await fetch('../js/addresses.json')).json();
+  } catch {
+    $('figs').innerHTML = '<div class="fig"><b>Not live yet</b><span>the fund launches shortly</span></div>';
+    return;
+  }
+  try {
+    relayInfo = await (await fetch('/api/relay')).json();
+    router = makeRouter({ web3: window.solanaWeb3, rpc: RPC_URL, addresses, relayer: relayInfo.relayer });
+  } catch (e) { $('warn').textContent = 'Investing is unavailable right now (gas service unreachable).'; }
+  await refresh();
+}
+
+async function refresh() {
+  fund = await readFund(rpc, addresses);
+  if (!fund.initialized) { $('figs').innerHTML = '<div class="fig"><b>Not live yet</b><span>the fund launches shortly</span></div>'; return; }
+  let prices = {};
+  try { prices = await jupiterPrices(fund.legs.map((l) => l.mint)); } catch {}
+  priced = value(fund, prices);
+  const f = fund.fees;
+  $('figs').innerHTML = [
+    [priced.priced ? usd(priced.total) : '—', 'fund value'],
+    [priced.priced ? usd(priced.navPerUnit) : '—', 'per PAIF'],
+    [fund.unitMint.supply.toLocaleString('en-US', { maximumFractionDigits: 2 }), 'PAIF in issue'],
+    [fund.capRemaining === null ? '—' : fund.capRemaining.toLocaleString('en-US', { maximumFractionDigits: 0 }), 'PAIF left under the cap'],
+    [`${f.entryBp / 100}% · ${f.exitBp / 100}% · ${f.streamBp / 100}%`, 'fees: entry · exit · yearly'],
+  ].map(([b, s]) => `<div class="fig"><b>${esc(b)}</b><span>${esc(s)}</span></div>`).join('');
+  $('warn').textContent = fund.warnings.join(' · ');
+  if (wallet) {
+    holder = await readHolder(rpc, addresses, wallet.toBase58());
+    $('mine').hidden = false;
+    $('mine').innerHTML = `<div class="fig"><b>${holder.units.toLocaleString('en-US', { maximumFractionDigits: 4 })}</b><span>your PAIF</span></div>` +
+      `<div class="fig"><b>${priced.priced ? usd(holder.units * priced.navPerUnit) : '—'}</b><span>worth</span></div>`;
+  }
+  gate();
+}
+
+function gate() {
+  const live = !!(fund && fund.initialized && router && wallet);
+  $('do-invest').disabled = !live;
+  $('do-withdraw').disabled = !live || !holder || holder.rawUnits === 0n;
+  $('wd-max').disabled = $('do-withdraw').disabled;
+}
+
+$('connect').onclick = async () => {
+  const p = provider();
+  if (!p) { $('who').textContent = 'Phantom not found — install it, or open this page in the browser that has it.'; return; }
+  try {
+    const r = await p.connect();
+    wallet = new window.solanaWeb3.PublicKey(r.publicKey.toString());
+    $('who').textContent = wallet.toBase58();
+    $('connect').textContent = 'Connected';
+    await refresh();
+  } catch { $('who').textContent = 'Connection declined.'; }
+};
+for (const [t, show] of [['invest', 'invest'], ['withdraw', 'withdraw']]) {
+  $('tab-' + t).onclick = () => {
+    for (const x of ['invest', 'withdraw']) { $('tab-' + x).setAttribute('aria-pressed', x === show); $('pane-' + x).hidden = x !== show; }
+  };
+}
+$('wd-max').onclick = () => { if (holder) $('wd-amt').value = (Number(holder.rawUnits) / 1e9).toString(); };
+
+/* Build → show what will happen → user signs all five in Phantom → the gas
+ * service checks, co-signs and submits them as one Jito bundle → confirm. */
+async function flow(kind) {
+  const out = $('out-' + kind);
+  out.innerHTML = '<p class="muted">Getting prices and routes…</p>';
+  let built;
+  try {
+    if (kind === 'invest') {
+      const coin = $('inv-coin').value;
+      const amount = toBase($('inv-amt').value, STABLES[coin].decimals);
+      if (amount < 5_000_000n) throw new Error('The minimum is 5 ' + coin + '.');
+      built = await router.buildInvest({ user: wallet.toBase58(), stable: coin, amount, tipAccount: relayInfo.tipAccount });
+      const s = built.summary;
+      const units = Number(s.minUnitsOut) / 1e9;
+      out.innerHTML = `<div class="confirm"><p>You pay <b>${(Number(s.amount) / 1e6).toFixed(2)} ${coin}</b>. Of that, <b>${(Number(s.gas) / 1e6).toFixed(2)}</b> repays network fees and your new token accounts (mostly a one-time cost), and the rest buys the four stocks in the fund's proportions.</p>
+        <p>You receive at least <b>${units.toLocaleString('en-US', { maximumFractionDigits: 4 })} PAIF</b>${priced && priced.priced ? ` (≈ ${usd(units * priced.navPerUnit)})` : ''}. Tiny amounts of the stock tokens may be left in your wallet.</p>
+        <div class="row"><button type="button" id="go-${kind}">Sign in Phantom</button><button type="button" class="ghost" id="no-${kind}">Cancel</button></div></div>`;
+    } else {
+      const coin = $('wd-coin').value;
+      const units = toBase($('wd-amt').value, 9);
+      if (units === 0n || units > holder.rawUnits) throw new Error('Enter an amount up to your PAIF balance.');
+      built = await router.buildRedeem({ user: wallet.toBase58(), stable: coin, units, tipAccount: relayInfo.tipAccount });
+      const s = built.summary;
+      out.innerHTML = `<div class="confirm"><p>You hand back <b>${(Number(units) / 1e9).toLocaleString('en-US', { maximumFractionDigits: 4 })} PAIF</b> and receive about <b>${(Number(s.net) / 1e6).toFixed(2)} ${coin}</b>, after ${(Number(s.gas) / 1e6).toFixed(2)} ${coin} of network fees. Each stock sale is protected against price moves of more than 1%.</p>
+        <div class="row"><button type="button" id="go-${kind}">Sign in Phantom</button><button type="button" class="ghost" id="no-${kind}">Cancel</button></div></div>`;
+    }
+  } catch (e) { out.innerHTML = `<p class="bad">${esc(e.message || e)}</p>`; return; }
+
+  $('no-' + kind).onclick = () => { out.innerHTML = '<p class="muted">Cancelled. Nothing was sent.</p>'; };
+  $('go-' + kind).onclick = async () => {
+    $('go-' + kind).disabled = true;
+    out.insertAdjacentHTML('beforeend', '<p class="muted" id="st-' + kind + '">Waiting for Phantom…</p>');
+    const st = (t, cls = 'muted') => { const el = $('st-' + kind); el.className = cls; el.innerHTML = t; };
+    try {
+      const signed = await provider().signAllTransactions(built.txs);
+      st('Sending…');
+      const enc = signed.map((t) => btoa(String.fromCharCode(...t.serialize())));
+      const r = await (await fetch('/api/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ txs: enc }) })).json();
+      if (r.error) throw new Error(r.error);
+      st('Sent as one bundle. Confirming…');
+      const sigs = r.signatures;
+      for (let i = 0; i < 40; i++) {
+        await new Promise((ok) => setTimeout(ok, 1500));
+        const s = await rpc.call('getSignatureStatuses', [sigs]);
+        const v = s.value;
+        if (v.every((x) => x && (x.confirmationStatus === 'confirmed' || x.confirmationStatus === 'finalized'))) {
+          if (v.some((x) => x.err)) throw new Error('A transaction failed on chain.');
+          st(`<b>Done.</b> <a href="https://solscan.io/tx/${sigs[sigs.length - 1]}" target="_blank" rel="noopener">View on Solscan</a>`, 'ok');
+          await refresh();
+          return;
+        }
+      }
+      st('Not confirmed within a minute. Nothing was taken unless all five steps landed — check your wallet, then try again with fresh prices.', 'warn');
+    } catch (e) {
+      st(esc(/reject/i.test(e.message || '') ? 'You declined in Phantom. Nothing was sent.' : (e.message || e)), 'bad');
+      const g = $('go-' + kind); if (g) g.disabled = false;
+    }
+  };
+}
+$('do-invest').onclick = () => flow('invest');
+$('do-withdraw').onclick = () => flow('withdraw');
+load();
+</script>
+</body>
+</html>
