@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "type": "module",
+  "description": "Vercel serverless functions under api/ (gas service, RPC proxy). The static site has no build step.",
+  "dependencies": {
+    "@noble/curves": "1.9.7",
+    "@solana/web3.js": "1.98.0",
+    "bs58": "4.0.1"
+  }
+}
