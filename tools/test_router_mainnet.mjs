@@ -15,7 +15,8 @@ const USER = 'H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS';
 const RELAYER = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
 const TIP = '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5';
 const addresses = derive('48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2'); // stand-in id; mainnet mints
-const seedState = { holdings: [2915247n, 1840129n, 1179223n, 880579n], supply: 25_000_000_000n, exitBp: 0n };
+const seedState = { holdings: [2915247n, 1840129n, 1179223n, 880579n], supply: 25_000_000_000n, exitBp: 0n,
+  bonus: { on: true, bp: 90n, lockDays: 30, max: 900_000_000n, nextPosition: 0n } };
 
 const router = makeRouter({ web3, rpc: RPC, addresses, relayer: RELAYER, fundOverride: seedState });
 const rpc = async (method, params) => (await (await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) })).json());
@@ -38,12 +39,15 @@ async function resolveAlts(txs) {
   return out;
 }
 
-for (const stable of ['USDC', 'USDT']) {
-  console.log(`\ninvest $20 of ${stable}`);
-  const { txs, summary } = await router.buildInvest({ user: USER, stable, amount: 20_000_000, tipAccount: TIP });
+for (const [stable, lock] of [['USDC', false], ['USDT', false], ['USDC', true]]) {
+  console.log(`\ninvest $20 of ${stable}${lock ? ', locked 30 days (setup-cost rebate)' : ''}`);
+  const { txs, summary } = await router.buildInvest({ user: USER, stable, amount: 20_000_000, tipAccount: TIP, lock });
   console.log(`  gas reimbursement $${Number(summary.gas) / 1e6} · split ${summary.split.map((s) => '$' + (Number(s) / 1e6).toFixed(2)).join(' ')}`);
   txs.forEach((t, i) => ok(t.serialize().length <= 1232, `tx ${i} size`, `${t.serialize().length} bytes`));
-  for (let i = 0; i < 4; i++) await simulate(txs[i], `swap ${i}`);
+  // Locked mode creates the user's PAIF account in swap 0; the PAIF mint only
+  // exists once the vault is on mainnet, so that transaction can't simulate yet.
+  for (let i = lock ? 1 : 0; i < 4; i++) await simulate(txs[i], `swap ${i}`);
+  if (lock) console.log('  skip  swap 0 (creates the PAIF account; the PAIF mint is not on mainnet yet)');
   const alts = await resolveAlts(txs);
   const sol = Number(summary.solUsd);
   try {
@@ -54,6 +58,14 @@ for (const stable of ['USDC', 'USDT']) {
     ok(true, 'gas service accepts the bundle', `cost ${r.costLamports} lamports = $${(r.costLamports / 1e9 * sol).toFixed(4)}, paid $${r.paidUsd.toFixed(4)}`);
   } catch (e) { ok(false, 'gas service accepts the bundle', e.message); }
 }
+
+console.log('\nclaim a locked position');
+const cl = await router.buildSettle({ user: USER, positionId: 0n, kind: 'claim', tipAccount: TIP });
+ok(cl.txs[0].serialize().length <= 1232, 'claim tx size', `${cl.txs[0].serialize().length} bytes`);
+try {
+  const r = check(cl.txs, { relayer: RELAYER, programId: addresses.programId, tipAccounts: new Set([TIP]), stableAccounts: {}, solUsd: 69 }, () => null, new Set(), web3);
+  ok(r.freeSettle, 'gas service accepts it without reimbursement', `cost ${r.costLamports} lamports`);
+} catch (e) { ok(false, 'gas service accepts the claim', e.message); }
 
 console.log('\nredeem 10 units to USDC');
 const red = await router.buildRedeem({ user: USER, stable: 'USDC', units: 10_000_000_000, tipAccount: TIP });

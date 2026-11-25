@@ -93,5 +93,20 @@ expectRefused('two different users in one bundle', () => run([good()[0], tx([...
 expectRefused('six transactions', () => run([...good(), ...good(), ...good()]), '1–5');
 expectRefused('a compute-budget heap request', () => run([tx([ix(new PublicKey('ComputeBudget111111111111111111111111111111'), [], [1, 0, 0, 1, 0]), reimburse(250000), tip()])]), 'compute-budget');
 
+console.log('locked bonus: position rent and free claim / exit');
+const disc = { deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141], claim_locked: [34, 206, 181, 23, 11, 207, 147, 90], exit_locked: [207, 93, 52, 157, 105, 252, 90, 187] };
+const ourIx = (name) => ix(PROGRAM, [m(U.publicKey, true, true), m(Keypair.generate().publicKey, false, true)], [...disc[name], 0, 0]);
+const gift = (lamports = 1_454_640, to = U.publicKey) => SystemProgram.transfer({ fromPubkey: R.publicKey, toPubkey: to, lamports });
+expectOk('locked deposit: gas key gives the user the position rent, reimbursed', () => run([tx([...budget(), gift(), ourIx('deposit_locked'), reimburse(400000), tip()])]));
+expectRefused('position rent without a locked deposit in the same transaction', () => run([tx([...budget(), gift(), ours(), reimburse(5_000_000), tip()])]), 'position rent');
+expectRefused('position rent above the cap', () => run([tx([...budget(), gift(LIMITS.POSITION_RENT + 1), ourIx('deposit_locked'), reimburse(5_000_000), tip()])]), 'position rent');
+expectRefused('position rent to someone other than the user', () => run([tx([...budget(), gift(1_454_640, Keypair.generate().publicKey), ourIx('deposit_locked'), reimburse(5_000_000), tip()])]), 'position rent');
+expectRefused('two position-rent gifts in one transaction', () => run([tx([...budget(), gift(), gift(), ourIx('deposit_locked'), reimburse(5_000_000), tip()])]), 'position rent');
+expectOk('a lone claim rides free (no stablecoin needed)', () => { const r = run([tx([...budget(), ourIx('claim_locked'), tip()])]); if (!r.freeSettle) throw new Error('not free'); return r; });
+expectOk('a lone exit rides free', () => run([tx([...budget(), ourIx('exit_locked'), tip()])]));
+expectRefused('claim plus a swap, unpaid', () => run([tx([...budget(), ourIx('claim_locked'), jupSwap(), tip()])]), 'below cost');
+expectRefused('claim plus a new token account, unpaid', () => run([tx([...budget(), createAta(R.publicKey, U.publicKey, M.publicKey), ourIx('claim_locked'), tip()])]), 'below cost');
+expectRefused('two claims in a two-transaction bundle, unpaid', () => run([tx([...budget(), ourIx('claim_locked'), tip()]), tx([...budget(), ourIx('claim_locked')])]), 'below cost');
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

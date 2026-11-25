@@ -5,14 +5,19 @@
  * rule is positional: the gas key may appear ONLY as
  *   1. the fee payer (account 0 of every transaction),
  *   2. the payer of an associated-token-account create (account 0 of that instruction),
- *   3. the source of one System transfer to a Jito tip account, at most MAX_TIP lamports.
+ *   3. the source of one System transfer to a Jito tip account, at most MAX_TIP lamports,
+ *   4. the source of one System transfer to the USER of at most POSITION_RENT lamports,
+ *      only in a transaction that also opens a locked position (deposit_locked) —
+ *      the program makes the depositor pay the position account's rent.
  * Anywhere else — any other instruction, any other position, including inside an
  * address lookup table — and the whole bundle is refused. That one rule is what
  * stops a crafted transaction from moving the gas service's SOL or tokens: every
  * such move needs the gas key as a signer or authority in some other position.
  *
  * Then it prices what the bundle costs the gas service and refuses unless the
- * stablecoin paid to the gas service's own USDC/USDT accounts covers it.
+ * stablecoin paid to the gas service's own USDC/USDT accounts covers it — except
+ * a lone claim or exit of a locked position (one per position, so bounded), which
+ * the gas service pays for: the user may hold no stablecoin at that point.
  */
 
 export const LIMITS = {
@@ -23,7 +28,15 @@ export const LIMITS = {
   LAMPORTS_PER_SIGNATURE: 5000,
   RENT_ATA: 2_140_000,        // the largest token account we create (xStock, 179 B)
   MARGIN: 1.1,                // the client adds 1.2; accept down to 1.1
+  POSITION_RENT: 1_500_000,   // a position account is 81 B = 1,454,640 lamports
 };
+
+const DISC = {
+  deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141],
+  claim_locked: [34, 206, 181, 23, 11, 207, 147, 90],
+  exit_locked: [207, 93, 52, 157, 105, 252, 90, 187],
+};
+const isIx = (data, name) => data.length >= 8 && DISC[name].every((b, i) => data[i] === b);
 
 export const ALLOWED_PROGRAMS = {
   ComputeBudget111111111111111111111111111111: 'compute-budget',
@@ -53,6 +66,9 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
   let paidBase = 0n;
   const created = new Set();
   let blockhash = null;
+  let settles = 0;        // claim / exit instructions
+  let others = 0;         // any other permafrost / jupiter / token instruction
+  let userGifts = 0;
 
   for (const [t, tx] of txs.entries()) {
     const m = tx.message;
@@ -83,6 +99,7 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
 
     let cuLimit = 200_000;
     let cuPrice = 0;
+    const opensPosition = m.compiledInstructions.some((ci) => allowed[keys[ci.programIdIndex]] === 'permafrost' && isIx(ci.data, 'deposit_locked'));
     for (const [n, ci] of m.compiledInstructions.entries()) {
       const prog = keys[ci.programIdIndex];
       const kind = allowed[prog];
@@ -107,16 +124,20 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
         continue;
       }
       if (kind === 'system') {
-        // Only the tip: Transfer (2) from the gas key to a Jito tip account.
+        // Transfer (2) from the gas key: to a Jito tip account, or the position
+        // rent to the user in a transaction that opens a locked position.
         const dv = new DataView(d.buffer, d.byteOffset);
-        if (d.length !== 12 || dv.getUint32(0, true) !== 2) refuse(`tx ${t} ix ${n}: only a tip transfer`);
-        if (acc[0] !== R || !ctx.tipAccounts.has(acc[1])) refuse(`tx ${t} ix ${n}: system transfer must be gas key → Jito tip`);
+        if (d.length !== 12 || dv.getUint32(0, true) !== 2) refuse(`tx ${t} ix ${n}: only a tip or position-rent transfer`);
         const lamports = Number(dv.getBigUint64(4, true));
-        tips += lamports;
-        cost += lamports;
-        continue;
+        if (acc[0] === R && ctx.tipAccounts.has(acc[1])) { tips += lamports; cost += lamports; continue; }
+        if (acc[0] === R && acc[1] === user && opensPosition && lamports <= LIMITS.POSITION_RENT && userGifts === 0) {
+          userGifts++; cost += lamports; continue;
+        }
+        refuse(`tx ${t} ix ${n}: system transfer must be gas key → Jito tip, or the position rent to the user`);
       }
       if (usesR.length) refuse(`tx ${t} ix ${n}: gas key used by ${kind}`);
+      if (kind === 'permafrost' && (isIx(d, 'claim_locked') || isIx(d, 'exit_locked'))) settles++;
+      else others++;
       if (kind === 'token') {
         // Count TransferChecked (12) into the gas service's own stable accounts.
         if (d[0] === 12 && ctx.stableAccounts[acc[2]] && ctx.stableAccounts[acc[2]] === acc[1]) {
@@ -136,6 +157,8 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
 
   const needUsd = (cost / 1e9) * ctx.solUsd * LIMITS.MARGIN;
   const paidUsd = Number(paidBase) / 10 ** STABLE_DECIMALS;
-  if (paidUsd + 1e-9 < needUsd) refuse(`reimbursement $${paidUsd.toFixed(4)} below cost $${needUsd.toFixed(4)}`);
-  return { user, costLamports: cost, paidUsd, needUsd, blockhash };
+  // A lone claim or exit, with nothing else that costs anything, rides free.
+  const freeSettle = txs.length === 1 && settles === 1 && others === 0 && created.size === 0 && userGifts === 0;
+  if (!freeSettle && paidUsd + 1e-9 < needUsd) refuse(`reimbursement $${paidUsd.toFixed(4)} below cost $${needUsd.toFixed(4)}`);
+  return { user, costLamports: cost, paidUsd, needUsd, blockhash, freeSettle };
 }

@@ -75,9 +75,14 @@ table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:ta
         <label for="inv-amt">Amount<input id="inv-amt" inputmode="decimal" placeholder="100" autocomplete="off"></label>
         <label for="inv-coin">Pay with<select id="inv-coin"><option>USDC</option><option>USDT</option></select></label>
       </div>
+      <label id="lock-row" class="row" style="display:none;gap:8px;color:var(--fg);font-size:14px" for="inv-lock">
+        <input id="inv-lock" type="checkbox" style="width:auto"> <span id="lock-text">Lock for 30 days and get your setup cost back</span>
+      </label>
       <div class="row"><button id="do-invest" type="button" disabled>Review investment</button></div>
       <div class="out" id="out-invest"></div>
     </div>
+
+    <div id="positions" class="out" hidden></div>
 
     <div id="pane-withdraw" class="out" hidden>
       <div class="two">
@@ -94,7 +99,7 @@ table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:ta
 
 <script src="../js/vendor/web3-1.98.0.iife.min.js"></script>
 <script type="module">
-import { Rpc, readFund, readHolder, value, jupiterPrices } from '../js/chain.js';
+import { Rpc, readFund, readHolder, readPositions, value, jupiterPrices } from '../js/chain.js';
 import { makeRouter, STABLES } from '../js/router.js';
 
 const $ = (id) => document.getElementById(id);
@@ -141,13 +146,71 @@ async function refresh() {
     [`${f.entryBp / 100}% · ${f.exitBp / 100}% · ${f.streamBp / 100}%`, 'fees: entry · exit · yearly'],
   ].map(([b, s]) => `<div class="fig"><b>${esc(b)}</b><span>${esc(s)}</span></div>`).join('');
   $('warn').textContent = fund.warnings.join(' · ');
+  const b = fund.lockedBonus;
+  const lockOn = b && b.on && b.poolUnits > 0;
+  $('lock-row').style.display = lockOn ? 'flex' : 'none';
+  if (lockOn) {
+    $('lock-text').textContent = `Lock for ${b.lockDays} days and get your setup cost back: +${b.bonusBp / 100}% in PAIF, up to ${b.maxBonusUnits} PAIF. Leave early any time without the bonus.`;
+  } else { $('inv-lock').checked = false; }
   if (wallet) {
     holder = await readHolder(rpc, addresses, wallet.toBase58());
     $('mine').hidden = false;
     $('mine').innerHTML = `<div class="fig"><b>${holder.units.toLocaleString('en-US', { maximumFractionDigits: 4 })}</b><span>your PAIF</span></div>` +
       `<div class="fig"><b>${priced.priced ? usd(holder.units * priced.navPerUnit) : '—'}</b><span>worth</span></div>`;
+    await renderPositions();
   }
   gate();
+}
+
+async function renderPositions() {
+  let list = [];
+  try { list = await readPositions(rpc, addresses, wallet.toBase58()); } catch { list = []; }
+  const el = $('positions');
+  el.hidden = list.length === 0;
+  if (!list.length) return;
+  const day = (t) => new Date(t * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
+  el.innerHTML = '<h2>Locked</h2><table><thead><tr><th>Unlocks</th><th class="num">PAIF</th><th class="num">Bonus</th><th></th></tr></thead><tbody>' +
+    list.map((p) => `<tr><td>${day(p.unlockAt)}</td><td class="num">${p.principal.toLocaleString('en-US', { maximumFractionDigits: 4 })}</td>` +
+      `<td class="num">${p.bonus.toLocaleString('en-US', { maximumFractionDigits: 4 })}</td>` +
+      `<td><button type="button" class="${p.matured ? '' : 'ghost'}" data-pos="${p.id}" data-kind="${p.matured ? 'claim' : 'exit'}">${p.matured ? 'Claim' : 'Leave early'}</button></td></tr>`).join('') +
+    '</tbody></table><div class="out" id="out-settle"></div>';
+  el.querySelectorAll('button[data-pos]').forEach((btn) => { btn.onclick = () => settle(BigInt(btn.dataset.pos), btn.dataset.kind); });
+}
+
+async function settle(id, kind) {
+  const out = $('out-settle');
+  if (kind === 'exit') {
+    out.innerHTML = `<div class="confirm"><p>Leaving early returns your PAIF in full but gives up the bonus. Continue?</p>
+      <div class="row"><button type="button" id="settle-go">Leave early</button><button type="button" class="ghost" id="settle-no">Keep it locked</button></div></div>`;
+    await new Promise((ok) => { $('settle-go').onclick = () => ok(); $('settle-no').onclick = () => { out.innerHTML = ''; }; });
+  }
+  out.innerHTML = '<p class="muted" id="st-settle">Waiting for Phantom…</p>';
+  try {
+    const { txs } = await router.buildSettle({ user: wallet.toBase58(), positionId: id, kind, tipAccount: relayInfo.tipAccount });
+    await send(txs, (t, cls) => { const e = $('st-settle'); e.className = cls || 'muted'; e.innerHTML = t; });
+  } catch (e) { out.innerHTML = `<p class="bad">${esc(/reject/i.test(e.message || '') ? 'You declined in Phantom.' : (e.message || e))}</p>`; }
+}
+
+/* Sign in Phantom → gas service checks, co-signs, submits → confirm. */
+async function send(txs, st) {
+  const signed = await provider().signAllTransactions(txs);
+  st('Sending…');
+  const enc = signed.map((t) => btoa(String.fromCharCode(...t.serialize())));
+  const r = await (await fetch('/api/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ txs: enc }) })).json();
+  if (r.error) throw new Error(r.error);
+  st('Sent. Confirming…');
+  const sigs = r.signatures;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((ok) => setTimeout(ok, 1500));
+    const v = (await rpc.call('getSignatureStatuses', [sigs])).value;
+    if (v.every((x) => x && (x.confirmationStatus === 'confirmed' || x.confirmationStatus === 'finalized'))) {
+      if (v.some((x) => x.err)) throw new Error('A transaction failed on chain.');
+      st(`<b>Done.</b> <a href="https://solscan.io/tx/${sigs[sigs.length - 1]}" target="_blank" rel="noopener">View on Solscan</a>`, 'ok');
+      await refresh();
+      return;
+    }
+  }
+  st('Not confirmed within a minute. Nothing was taken unless every step landed — check your wallet, then try again with fresh prices.', 'warn');
 }
 
 function gate() {
@@ -186,11 +249,13 @@ async function flow(kind) {
       const coin = $('inv-coin').value;
       const amount = toBase($('inv-amt').value, STABLES[coin].decimals);
       if (amount < 5_000_000n) throw new Error('The minimum is 5 ' + coin + '.');
-      built = await router.buildInvest({ user: wallet.toBase58(), stable: coin, amount, tipAccount: relayInfo.tipAccount });
+      const lock = $('inv-lock').checked;
+      built = await router.buildInvest({ user: wallet.toBase58(), stable: coin, amount, tipAccount: relayInfo.tipAccount, lock });
       const s = built.summary;
       const units = Number(s.minUnitsOut) / 1e9;
+      const lockLine = lock ? `<p>Your PAIF and a bonus of about <b>${(Number(s.bonus) / 1e9).toFixed(4)} PAIF</b> are held for <b>${s.lockDays} days</b>; then press Claim. You can leave early any time and get your PAIF back, without the bonus.</p>` : '';
       out.innerHTML = `<div class="confirm"><p>You pay <b>${(Number(s.amount) / 1e6).toFixed(2)} ${coin}</b>. Of that, <b>${(Number(s.gas) / 1e6).toFixed(2)}</b> repays network fees and your new token accounts (mostly a one-time cost), and the rest buys the four stocks in the fund's proportions.</p>
-        <p>You receive at least <b>${units.toLocaleString('en-US', { maximumFractionDigits: 4 })} PAIF</b>${priced && priced.priced ? ` (≈ ${usd(units * priced.navPerUnit)})` : ''}. Tiny amounts of the stock tokens may be left in your wallet.</p>
+        <p>You receive at least <b>${units.toLocaleString('en-US', { maximumFractionDigits: 4 })} PAIF</b>${priced && priced.priced ? ` (≈ ${usd(units * priced.navPerUnit)})` : ''}. Tiny amounts of the stock tokens may be left in your wallet.</p>${lockLine}
         <div class="row"><button type="button" id="go-${kind}">Sign in Phantom</button><button type="button" class="ghost" id="no-${kind}">Cancel</button></div></div>`;
     } else {
       const coin = $('wd-coin').value;
@@ -208,27 +273,8 @@ async function flow(kind) {
     $('go-' + kind).disabled = true;
     out.insertAdjacentHTML('beforeend', '<p class="muted" id="st-' + kind + '">Waiting for Phantom…</p>');
     const st = (t, cls = 'muted') => { const el = $('st-' + kind); el.className = cls; el.innerHTML = t; };
-    try {
-      const signed = await provider().signAllTransactions(built.txs);
-      st('Sending…');
-      const enc = signed.map((t) => btoa(String.fromCharCode(...t.serialize())));
-      const r = await (await fetch('/api/relay', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ txs: enc }) })).json();
-      if (r.error) throw new Error(r.error);
-      st('Sent as one bundle. Confirming…');
-      const sigs = r.signatures;
-      for (let i = 0; i < 40; i++) {
-        await new Promise((ok) => setTimeout(ok, 1500));
-        const s = await rpc.call('getSignatureStatuses', [sigs]);
-        const v = s.value;
-        if (v.every((x) => x && (x.confirmationStatus === 'confirmed' || x.confirmationStatus === 'finalized'))) {
-          if (v.some((x) => x.err)) throw new Error('A transaction failed on chain.');
-          st(`<b>Done.</b> <a href="https://solscan.io/tx/${sigs[sigs.length - 1]}" target="_blank" rel="noopener">View on Solscan</a>`, 'ok');
-          await refresh();
-          return;
-        }
-      }
-      st('Not confirmed within a minute. Nothing was taken unless all five steps landed — check your wallet, then try again with fresh prices.', 'warn');
-    } catch (e) {
+    try { await send(built.txs, st); }
+    catch (e) {
       st(esc(/reject/i.test(e.message || '') ? 'You declined in Phantom. Nothing was sent.' : (e.message || e)), 'bad');
       const g = $('go-' + kind); if (g) g.disabled = false;
     }

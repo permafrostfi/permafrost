@@ -25,10 +25,18 @@ export const PROGRAMS = {
   jupiter: 'JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4',
 };
 const SOL_MINT = 'So11111111111111111111111111111111111111112';
-const DISC = {
+export const DISC = {
   deposit: [242, 35, 198, 137, 82, 225, 242, 182],
   redeem: [184, 12, 86, 149, 70, 196, 97, 225],
+  deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141],
+  claim_locked: [34, 206, 181, 23, 11, 207, 147, 90],
+  exit_locked: [207, 93, 52, 157, 105, 252, 90, 187],
 };
+/* Rent of a locked-bonus position account (81 bytes). The program makes the
+ * depositor pay it, so the gas service hands the user exactly this much SOL in
+ * the same transaction (reimbursed in stables); it comes back to the user when
+ * the position is claimed or exited. */
+export const POSITION_RENT = 1454640;
 
 /* Pricing for the gas reimbursement — shared with the gas service, which
  * recomputes it and refuses a bundle that under-pays. */
@@ -71,10 +79,18 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
   const ix = (programId, keys, data) => new W.TransactionInstruction({ programId, keys, data: typeof Buffer !== 'undefined' ? Buffer.from(data) : data });
 
   async function call(method, params) {
-    const r = await fetchImpl(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
-    const j = await r.json();
-    if (j.error) throw new Error(`${method}: ${j.error.message}`);
-    return j.result;
+    // Retries rate limits with backoff: a throttled read must never become a wrong number.
+    let last;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      if (attempt) await new Promise((ok) => setTimeout(ok, 500 * 2 ** (attempt - 1)));
+      const r = await fetchImpl(rpc, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }) });
+      if (r.status === 429 || r.status >= 500) { last = new Error(`${method}: http ${r.status}`); continue; }
+      const j = await r.json();
+      if (j.error && /rate limit/i.test(j.error.message || '')) { last = new Error(`${method}: ${j.error.message}`); continue; }
+      if (j.error) throw new Error(`${method}: ${j.error.message}`);
+      return j.result;
+    }
+    throw last;
   }
   async function exists(keys) {
     const r = await call('getMultipleAccounts', [keys.map((k) => k.toBase58()), { encoding: 'base64', dataSlice: { offset: 0, length: 0 } }]);
@@ -96,6 +112,13 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
       holdings: legs.map(tokenAmount),
       supply: new DataView(mint.buffer, mint.byteOffset).getBigUint64(36, true),
       exitBp: BigInt(dv.getUint16(109, true)),
+      bonus: {
+        on: vault[19] === 1 && vault[20] === 1,
+        bp: BigInt(dv.getUint16(21, true)),
+        lockDays: dv.getUint16(23, true),
+        max: dv.getBigUint64(25, true),
+        nextPosition: dv.getBigUint64(33, true),
+      },
     };
   }
 
@@ -179,9 +202,15 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     return new W.VersionedTransaction(msg);
   }
 
+  const pool = W.PublicKey.findProgramAddressSync([enc.encode('pool')], PK(addresses.programId))[0];
+  const escrow = W.PublicKey.findProgramAddressSync([enc.encode('escrow')], PK(addresses.programId))[0];
+  const positionPda = (id) => W.PublicKey.findProgramAddressSync([enc.encode('position'), u64le(id)], PK(addresses.programId))[0];
+
   /* ------------------------------------------------------------ invest */
-  /* Returns { txs, summary }. `amount` is in the stablecoin's base units. */
-  async function buildInvest({ user: userStr, stable: stableName, amount, tipAccount }) {
+  /* Returns { txs, summary }. `amount` is in the stablecoin's base units.
+   * lock: true → a locked deposit (the setup-cost rebate, decided 25 Nov): the
+   * units and the bonus sit in escrow for the lock period; claim afterwards. */
+  async function buildInvest({ user: userStr, stable: stableName, amount, tipAccount, lock = false }) {
     const user = PK(userStr);
     const stable = STABLES[stableName];
     if (!stable) throw new Error('stable must be USDC or USDT');
@@ -197,8 +226,8 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     const unitNew = !have[4];
 
     // Reserve the gas reimbursement first, then split the rest by vault value.
-    const est = [0, 1, 2, 3].map((i) => txCost(400000, legNew[i] ? 1 : 0, 0, false))
-      .concat([txCost(250000, unitNew ? 1 : 0, 0, true)]);
+    const est = [0, 1, 2, 3].map((i) => txCost(400000, (legNew[i] ? 1 : 0) + (lock && i === 0 && unitNew ? 1 : 0), 0, false))
+      .concat([txCost(250000, !lock && unitNew ? 1 : 0, 0, true) + (lock ? POSITION_RENT : 0)]);
     const gas = est.map((l) => toStable(l, solUsd, stable));
     const gasTotal = gas.reduce((a, b) => a + b, 0n);
     const spend = BigInt(amount) - gasTotal;
@@ -214,7 +243,11 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     const txs = [];
     for (let i = 0; i < 4; i++) {
       const alts = await lookupTables(parts[i].alts);
-      const ixs = [...budget(parts[i].cu), createAta(user, A.legMints[i], P.token2022), parts[i].swap, reimburse(user, stable, gas[i])];
+      const ixs = [...budget(parts[i].cu), createAta(user, A.legMints[i], P.token2022)];
+      // A locked deposit doesn't touch the PAIF account, but claiming will:
+      // create it here, where there's room, rather than at claim time.
+      if (lock && i === 0) ixs.push(createAta(user, A.unitMint, P.token2022));
+      ixs.push(parts[i].swap, reimburse(user, stable, gas[i]));
       txs.push(await compile(user, ixs, alts, blockhash));
     }
     // Deposit what the swaps are guaranteed to deliver (Jupiter's minimum out).
@@ -224,8 +257,36 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     for (let i = 0; i < 4; i++) { const r = (minOut[i] * 10n ** 18n) / f.holdings[i]; if (k === null || r < k) k = r; }
     const unitsMin = (k * supplyEff) / 10n ** 18n;
     const minUnitsOut = (unitsMin * 9900n) / 10000n;
-    const depositIx = ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.deposit), ...minOut.map(u64le), u64le(minUnitsOut)));
-    const last = [...budget(250000), createAta(user, A.unitMint, P.token2022), depositIx, reimburse(user, stable, gas[4]), tip(tipAccount)];
+    let last;
+    let bonus = 0n;
+    let positionId = null;
+    if (!lock) {
+      const depositIx = ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.deposit), ...minOut.map(u64le), u64le(minUnitsOut)));
+      last = [...budget(250000), createAta(user, A.unitMint, P.token2022), depositIx, reimburse(user, stable, gas[4]), tip(tipAccount)];
+    } else {
+      const b = f.bonus;
+      if (!b || !b.on) throw new Error('locked investing is switched off');
+      const [poolRaw] = await readRaw([pool]);
+      const poolBal = tokenAmount(poolRaw);
+      bonus = [(unitsMin * b.bp) / 10000n, b.max, poolBal].reduce((x, y) => (y < x ? y : x));
+      positionId = b.nextPosition;
+      const keys = [
+        meta(user, true, true), meta(A.vault, false, true), meta(A.unitMint, false, true),
+        meta(pool, false, true), meta(escrow, false, true), meta(positionPda(positionId), false, true),
+        ...A.legMints.map((m) => meta(m, false, false)), ...A.vaultLegs.map((v) => meta(v, false, true)),
+        ...A.legMints.map((m) => meta(ata(user, m, P.token2022), false, true)),
+        meta(P.token2022, false, false), meta(P.system, false, false), meta(A.feeAccount, false, true),
+      ];
+      const data = cat(Uint8Array.from(DISC.deposit_locked), ...minOut.map(u64le), u64le(minUnitsOut),
+        Uint8Array.from([b.lockDays & 0xff, b.lockDays >> 8]), u64le((bonus * 9900n) / 10000n));
+      // The position account's rent: the gas service gives it to the user here.
+      const rent = W.SystemProgram.transfer({ fromPubkey: RELAYER, toPubkey: user, lamports: POSITION_RENT });
+      // No compute-budget instructions here: this transaction is the largest the
+      // router builds (1,249 bytes with them; the limit is 1,232). The default
+      // compute allowance covers deposit_locked (~83k), and the Jito tip, not a
+      // priority fee, gets the bundle included.
+      last = [rent, ix(A.program, keys, data), reimburse(user, stable, gas[4]), tip(tipAccount)];
+    }
     txs.push(await compile(user, last, [], blockhash));
 
     return {
@@ -233,7 +294,8 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
       summary: {
         stable: stableName, amount: BigInt(amount), gas: gasTotal, spend, split,
         expectedLegs: quotes.map((q) => BigInt(q.outAmount)), minLegs: minOut,
-        minUnitsOut, solUsd, legUsd,
+        minUnitsOut, solUsd, legUsd, lock, bonus, positionId,
+        lockDays: lock ? f.bonus.lockDays : 0,
       },
     };
   }
@@ -286,5 +348,22 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     return { txs, summary: { stable: stableName, units: u, payout, sell, expected, gas, net: expected - gas, solUsd } };
   }
 
-  return { buildInvest, buildRedeem, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64 };
+  /* ------------------------------------------------------- claim / exit */
+  /* One transaction; the gas service pays it without reimbursement (one per
+   * position, so bounded). claim: at or after maturity, principal + bonus to the
+   * user's PAIF. exit: before maturity, principal back, bonus to the pool. */
+  async function buildSettle({ user: userStr, positionId, kind, tipAccount }) {
+    if (kind !== 'claim' && kind !== 'exit') throw new Error('claim or exit');
+    const user = PK(userStr);
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    const keys = [
+      meta(user, true, true), meta(A.vault, false, false), meta(A.unitMint, false, false),
+      meta(pool, false, true), meta(escrow, false, true), meta(positionPda(positionId), false, true),
+      meta(ata(user, A.unitMint, P.token2022), false, true), meta(P.token2022, false, false),
+    ];
+    const ixs = [...budget(60000), ix(A.program, keys, Uint8Array.from(kind === 'claim' ? DISC.claim_locked : DISC.exit_locked)), tip(tipAccount)];
+    return { txs: [await compile(user, ixs, [], blockhash)] };
+  }
+
+  return { buildInvest, buildRedeem, buildSettle, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64, positionPda };
 }
