@@ -68,6 +68,9 @@ async function solUsd() {
 }
 
 export default async function handler(req, res) {
+  if (!process.env.RELAYER_SECRET_KEY || !process.env.RPC_URL || !process.env.PROGRAM_ID) {
+    return res.status(503).json({ error: 'gas service not configured (RELAYER_SECRET_KEY, RPC_URL, PROGRAM_ID)' });
+  }
   try {
     const relayer = kp().publicKey;
     const stableAccounts = Object.fromEntries(Object.keys(STABLES).map((m) => [ataOf(relayer, m), m]));
