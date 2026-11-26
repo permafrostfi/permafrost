@@ -26,9 +26,9 @@ export const LIMITS = {
   MAX_CU_PRICE: 50_000,       // micro-lamports per CU
   MAX_CU_LIMIT: 1_400_000,
   LAMPORTS_PER_SIGNATURE: 5000,
-  RENT_ATA: 2_140_000,        // the largest token account we create (xStock, 179 B)
+  RENT_ATA: 1_600_000,        // xStock account 179 B = 1,559,560 on 26 Nov (+2.6%); the client charges live rent x1.2
   MARGIN: 1.1,                // the client adds 1.2; accept down to 1.1
-  POSITION_RENT: 1_500_000,   // a position account is 81 B = 1,454,640 lamports
+  POSITION_RENT: 1_170_000,   // upper bound: position account 81 B = 1,061,720 on 26 Nov, +10%
 };
 
 const DISC = {

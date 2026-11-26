@@ -32,11 +32,13 @@ export const DISC = {
   claim_locked: [34, 206, 181, 23, 11, 207, 147, 90],
   exit_locked: [207, 93, 52, 157, 105, 252, 90, 187],
 };
-/* Rent of a locked-bonus position account (81 bytes). The program makes the
- * depositor pay it, so the gas service hands the user exactly this much SOL in
- * the same transaction (reimbursed in stables); it comes back to the user when
- * the position is claimed or exited. */
-export const POSITION_RENT = 1454640;
+/* Account sizes the router creates. Their rent is read from the cluster at build
+ * time (getMinimumBalanceForRentExemption), never hard-coded: on 26 Nov the live
+ * rate was ~27% below the long-standing figure (179 B = 1,559,560 lamports, not
+ * 2,136,720). The position account (81 B) is the one the program makes the
+ * depositor pay for, so the gas service hands the user exactly that much SOL in
+ * the same transaction; it comes back to the user at claim or exit. */
+export const SIZES = { xstockAccount: 179, paifAccount: 170, stableAccount: 165, position: 81 };
 
 /* Pricing for the gas reimbursement — shared with the gas service, which
  * recomputes it and refuses a bundle that under-pays. */
@@ -44,8 +46,8 @@ export const GAS = {
   lamportsPerSignature: 5000,
   microLamportsPerCu: 10000,       // priority fee; inclusion comes from the Jito tip
   tipLamports: 20000,               // Jito tip, once per bundle (≈ $0.0014 at $69)
-  rentTokenAccount2022: 2140000,    // measured: xStock account 179 B = 2,136,720; PAIF 170 B = 2,074,080
-  rentTokenAccount: 2040000,        // classic SPL token account (USDC / USDT), 165 B
+  rentTokenAccount2022: 1560000,    // fallback only; live rent is fetched (179 B = 1,559,560 on 26 Nov)
+  rentTokenAccount: 1490000,        // fallback only (165 B = 1,488,440 on 26 Nov)
   margin: 1.2,                      // on top of cost, covers SOL price drift
   minimumUsd: 0.01,
 };
@@ -187,6 +189,17 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     ];
   }
 
+  let rent = null;
+  async function loadRent() {
+    if (rent) return rent;
+    const [x, p, st, pos] = await Promise.all([SIZES.xstockAccount, SIZES.paifAccount, SIZES.stableAccount, SIZES.position]
+      .map((n) => call('getMinimumBalanceForRentExemption', [n])));
+    rent = { x2022: Math.max(x, p), classic: st, position: pos };
+    GAS.rentTokenAccount2022 = rent.x2022;
+    GAS.rentTokenAccount = rent.classic;
+    return rent;
+  }
+
   /* Gas cost of one transaction for the gas service, in lamports. */
   const txCost = (cuLimit, newAtas2022, newAtasClassic, withTip) =>
     2 * GAS.lamportsPerSignature + Math.ceil((cuLimit * GAS.microLamportsPerCu) / 1e6) +
@@ -212,6 +225,7 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
    * units and the bonus sit in escrow for the lock period; claim afterwards. */
   async function buildInvest({ user: userStr, stable: stableName, amount, tipAccount, lock = false }) {
     const user = PK(userStr);
+    const R0 = await loadRent();
     const stable = STABLES[stableName];
     if (!stable) throw new Error('stable must be USDC or USDT');
     const f = await fund();
@@ -227,7 +241,7 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
 
     // Reserve the gas reimbursement first, then split the rest by vault value.
     const est = [0, 1, 2, 3].map((i) => txCost(400000, (legNew[i] ? 1 : 0) + (lock && i === 0 && unitNew ? 1 : 0), 0, false))
-      .concat([txCost(250000, !lock && unitNew ? 1 : 0, 0, true) + (lock ? POSITION_RENT : 0)]);
+      .concat([txCost(250000, !lock && unitNew ? 1 : 0, 0, true) + (lock ? R0.position : 0)]);
     const gas = est.map((l) => toStable(l, solUsd, stable));
     const gasTotal = gas.reduce((a, b) => a + b, 0n);
     const spend = BigInt(amount) - gasTotal;
@@ -280,12 +294,12 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
       const data = cat(Uint8Array.from(DISC.deposit_locked), ...minOut.map(u64le), u64le(minUnitsOut),
         Uint8Array.from([b.lockDays & 0xff, b.lockDays >> 8]), u64le((bonus * 9900n) / 10000n));
       // The position account's rent: the gas service gives it to the user here.
-      const rent = W.SystemProgram.transfer({ fromPubkey: RELAYER, toPubkey: user, lamports: POSITION_RENT });
+      const rentGift = W.SystemProgram.transfer({ fromPubkey: RELAYER, toPubkey: user, lamports: R0.position });
       // No compute-budget instructions here: this transaction is the largest the
       // router builds (1,249 bytes with them; the limit is 1,232). The default
       // compute allowance covers deposit_locked (~83k), and the Jito tip, not a
       // priority fee, gets the bundle included.
-      last = [rent, ix(A.program, keys, data), reimburse(user, stable, gas[4]), tip(tipAccount)];
+      last = [rentGift, ix(A.program, keys, data), reimburse(user, stable, gas[4]), tip(tipAccount)];
     }
     txs.push(await compile(user, last, [], blockhash));
 
@@ -303,6 +317,7 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
   /* ------------------------------------------------------------ redeem */
   async function buildRedeem({ user: userStr, stable: stableName, units, tipAccount }) {
     const user = PK(userStr);
+    await loadRent();
     const stable = STABLES[stableName];
     if (!stable) throw new Error('stable must be USDC or USDT');
     const f = await fund();
