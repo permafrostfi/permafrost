@@ -39,7 +39,7 @@ input,select{font:15px var(--mono);padding:9px 10px;border:1px solid var(--line)
 .two{display:grid;grid-template-columns:2fr 1fr;gap:10px}
 .tabs{display:inline-flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .tabs button{border:0;border-radius:0;background:transparent;color:var(--muted)} .tabs button[aria-pressed="true"]{background:var(--accent);color:var(--accent-ink)}
-.out{display:grid;gap:8px} .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+[hidden]{display:none!important} .out{display:grid;gap:8px} .ok{color:var(--ok)} .warn{color:var(--warn)} .bad{color:var(--bad)}
 .confirm{border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;gap:8px}
 table{border-collapse:collapse;width:100%;font-size:14px;font-variant-numeric:tabular-nums} td,th{padding:5px 6px;border-bottom:1px solid var(--line);text-align:left} td.num,th.num{text-align:right}
 .note{font-size:13px;color:var(--muted)}
@@ -167,7 +167,7 @@ async function renderPositions() {
   try { list = await readPositions(rpc, addresses, wallet.toBase58()); } catch { list = []; }
   const el = $('positions');
   el.hidden = list.length === 0;
-  if (!list.length) return;
+  if (!list.length) { el.innerHTML = ''; return; }
   const day = (t) => new Date(t * 1000).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' });
   el.innerHTML = '<h2>Locked</h2><table><thead><tr><th>Unlocks</th><th class="num">PAIF</th><th class="num">Bonus</th><th></th></tr></thead><tbody>' +
     list.map((p) => `<tr><td>${day(p.unlockAt)}</td><td class="num">${p.principal.toLocaleString('en-US', { maximumFractionDigits: 4 })}</td>` +

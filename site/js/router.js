@@ -156,7 +156,27 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
   async function lookupTables(addrs) {
     if (!addrs.length) return [];
     const raw = await readRaw(addrs.map(PK));
-    return raw.map((d, i) => new W.AddressLookupTableAccount({ key: PK(addrs[i]), state: W.AddressLookupTableAccount.deserialize(d) }));
+    return raw.map((d, i) => new W.AddressLookupTableAccount({ key: PK(addrs[i]), state: decodeLookupTable(d) }));
+  }
+
+    /* Address lookup table account: u32 type, u64 deactivation slot, u64 last
+   * extended slot, u8 start index, Option<Pubkey> authority (1 + 32), 2 bytes
+   * padding — 56 bytes — then the addresses, 32 bytes each. Decoded by hand:
+   * web3.js's AddressLookupTableAccount.deserialize calls Node's Buffer and throws
+   * in the browser (found 26 Nov by tools/test_router_browser.mjs). */
+  function decodeLookupTable(d) {
+    if (d.length < 56 || (d.length - 56) % 32) throw new Error('not an address lookup table');
+    const dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+    if (dv.getUint32(0, true) !== 1) throw new Error('lookup table not initialized');
+    const addresses = [];
+    for (let o = 56; o < d.length; o += 32) addresses.push(new W.PublicKey(d.slice(o, o + 32)));
+    return {
+      deactivationSlot: dv.getBigUint64(4, true),
+      lastExtendedSlot: Number(dv.getBigUint64(12, true)),
+      lastExtendedSlotStartIndex: d[20],
+      authority: d[21] === 1 ? new W.PublicKey(d.slice(22, 54)) : undefined,
+      addresses,
+    };
   }
 
   /* An ATA the gas service pays for — replaces Jupiter's user-paid setup step. */
@@ -174,11 +194,18 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     ], cat(Uint8Array.from([12]), u64le(amount), Uint8Array.from([stable.decimals])));
   };
 
+  /* Compute-budget and SOL-transfer instructions are encoded here, not with
+   * web3.js's ComputeBudgetProgram / SystemProgram helpers: in the browser build
+   * (web3-1.98.0.iife) those call Node's Buffer for their u64 fields and throw
+   * "Buffer is not defined" (found 26 Nov by tools/test_app_lock.mjs). */
+  const u32le = (v) => { const b = new Uint8Array(4); new DataView(b.buffer).setUint32(0, v, true); return b; };
   const budget = (cu) => [
-    W.ComputeBudgetProgram.setComputeUnitLimit({ units: Math.min(1_400_000, Math.ceil(cu * 1.2) + 30_000) }),
-    W.ComputeBudgetProgram.setComputeUnitPrice({ microLamports: GAS.microLamportsPerCu }),
+    ix(P.computeBudget, [], cat(Uint8Array.from([2]), u32le(Math.min(1_400_000, Math.ceil(cu * 1.2) + 30_000)))),
+    ix(P.computeBudget, [], cat(Uint8Array.from([3]), u64le(GAS.microLamportsPerCu))),
   ];
-  const tip = (account) => W.SystemProgram.transfer({ fromPubkey: RELAYER, toPubkey: PK(account), lamports: GAS.tipLamports });
+  const solTransfer = (from, to, lamports) =>
+    ix(P.system, [meta(from, true, true), meta(to, false, true)], cat(u32le(2), u64le(lamports)));
+  const tip = (account) => solTransfer(RELAYER, PK(account), GAS.tipLamports);
 
   function userMetas(user, userUnit) {
     return [
@@ -294,7 +321,7 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
       const data = cat(Uint8Array.from(DISC.deposit_locked), ...minOut.map(u64le), u64le(minUnitsOut),
         Uint8Array.from([b.lockDays & 0xff, b.lockDays >> 8]), u64le((bonus * 9900n) / 10000n));
       // The position account's rent: the gas service gives it to the user here.
-      const rentGift = W.SystemProgram.transfer({ fromPubkey: RELAYER, toPubkey: user, lamports: R0.position });
+      const rentGift = solTransfer(RELAYER, user, R0.position);
       // No compute-budget instructions here: this transaction is the largest the
       // router builds (1,249 bytes with them; the limit is 1,232). The default
       // compute allowance covers deposit_locked (~83k), and the Jito tip, not a
