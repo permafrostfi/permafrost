@@ -372,6 +372,9 @@ def install_elf(w, elf):
 def U1_live_v1_vault_upgrades_to_v3_without_migration():
     if DEVNET:
         return "SKIPPED on the devnet build: the v1 fixture binary names the mainnet mints"
+    if str(PROGRAM_ID) != "48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2":
+        return ("SKIPPED: the v1 fixture binary declares the old shared id 48N2…; mainnet launches "
+                "v3 directly (decided 23 Nov), so there is no live v1 vault to upgrade")
     v1_elf = (ROOT / "fixtures" / "permafrost_v1.so").read_bytes()
     w = World()
     # Swap our program for the v1 binary, as it will be on mainnet.

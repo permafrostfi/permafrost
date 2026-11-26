@@ -41,7 +41,9 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
 FIX = ROOT / "fixtures"
 
-PROGRAM_ID = Pubkey.from_string("48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2")
+# The devnet build and the mainnet build declare different program ids.
+PROGRAM_ID = Pubkey.from_string("48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2" if os.environ.get("PF_DEVNET") == "1"
+                                else "EDp2AwfRiWEbM3K1bF5SY5SJGcFTjBZRPENKXk7Eoy61")
 TOKEN_2022 = Pubkey.from_string("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb")
 ATA_PROGRAM = Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
 SYSTEM = Pubkey.from_string("11111111111111111111111111111111")

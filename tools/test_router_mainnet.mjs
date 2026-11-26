@@ -14,7 +14,7 @@ const RPC = process.argv[2] || 'https://api.mainnet-beta.solana.com';
 const USER = 'H8sMJSCQxfKiFTCfDR3DUMLPwcRbM61LGFJ8N4dK3WjS';
 const RELAYER = '9WzDXwBbmkg8ZTbNMqUxvQRAyrZzDsGYdLVL9zYtAWWM';
 const TIP = '96gYZGLnJYVFmbjzopPSU6QiEV5fGqZNyN9nmNhvrZU5';
-const addresses = derive('48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2'); // stand-in id; mainnet mints
+const addresses = derive('EDp2AwfRiWEbM3K1bF5SY5SJGcFTjBZRPENKXk7Eoy61'); // the mainnet id (not deployed yet at test time)
 const seedState = { holdings: [2915247n, 1840129n, 1179223n, 880579n], supply: 25_000_000_000n, exitBp: 0n,
   bonus: { on: true, bp: 90n, lockDays: 30, max: 900_000_000n, nextPosition: 0n } };
 

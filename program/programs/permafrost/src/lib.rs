@@ -42,6 +42,10 @@ use anchor_spl::token_2022_extensions::token_metadata::{
 use anchor_spl::token_interface::{self, Burn, Mint, MintTo, TokenAccount, TransferChecked};
 use permafrost_core as pf;
 
+// Mainnet and devnet are separate deployments with separate program ids.
+#[cfg(not(feature = "devnet"))]
+declare_id!("EDp2AwfRiWEbM3K1bF5SY5SJGcFTjBZRPENKXk7Eoy61");
+#[cfg(feature = "devnet")]
 declare_id!("48N2qchckkoWhmT9anrDU7bRt83QPLNBqj9JLZA7kEF2");
 
 // ------------------------------------------------------------------ constants
