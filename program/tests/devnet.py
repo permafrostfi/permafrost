@@ -232,7 +232,15 @@ def cmd_e2e():
 def cmd_user():
     """What a depositor does, against a vault someone else administers (the rehearsal)."""
     me = DEPLOYER
-    alice = Keypair.from_seed(bytes(32 * [8]))  # devnet-only throwaway
+    # devnet-only throwaway, random and kept locally (a fixed seed like [8]*32 is a
+    # public key anyone can squat on: on 26 Nov that one was a program-owned account)
+    path = os.path.expanduser("~/devnet/user.json")
+    if os.path.exists(path):
+        alice = Keypair.from_bytes(bytes(json.load(open(path))))
+    else:
+        alice = Keypair()
+        json.dump(list(bytes(alice)), open(path, "w"))
+    print(f"  test investor {alice.pubkey()}")
     if (account(alice.pubkey()) or (0,))[0] < 30_000_000:
         send([transfer(TransferParams(from_pubkey=me.pubkey(), to_pubkey=alice.pubkey(),
                                       lamports=60_000_000))], [me], label="fund user 0.06 SOL")
