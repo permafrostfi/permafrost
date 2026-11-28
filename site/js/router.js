@@ -95,11 +95,12 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     throw last;
   }
   async function exists(keys) {
-    const r = await call('getMultipleAccounts', [keys.map((k) => k.toBase58()), { encoding: 'base64', dataSlice: { offset: 0, length: 0 } }]);
+    // 'confirmed', not the default 'finalized' (~13 s behind): step 2 must see what step 1 just did.
+    const r = await call('getMultipleAccounts', [keys.map((k) => k.toBase58()), { encoding: 'base64', dataSlice: { offset: 0, length: 0 }, commitment: 'confirmed' }]);
     return r.value.map((v) => v !== null);
   }
   async function readRaw(keys) {
-    const r = await call('getMultipleAccounts', [keys.map((k) => k.toBase58()), { encoding: 'base64' }]);
+    const r = await call('getMultipleAccounts', [keys.map((k) => k.toBase58()), { encoding: 'base64', commitment: 'confirmed' }]);
     return r.value.map((v) => (v ? fromB64(v.data[0]) : null));
   }
   const tokenAmount = (d) => (d ? new DataView(d.buffer, d.byteOffset).getBigUint64(64, true) : 0n);
@@ -247,9 +248,14 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
   const positionPda = (id) => W.PublicKey.findProgramAddressSync([enc.encode('position'), u64le(id)], PK(addresses.programId))[0];
 
   /* ------------------------------------------------------------ invest */
-  /* Returns { txs, summary }. `amount` is in the stablecoin's base units.
-   * lock: true → a locked deposit (the setup-cost rebate, decided 25 Nov): the
-   * units and the bonus sit in escrow for the lock period; claim afterwards. */
+  /* Two signing steps (28 Nov). Phantom simulates each transaction on its own and
+   * warns "this dApp could be malicious" when one fails. The deposit can't simulate
+   * before the swaps have delivered the stocks, so it is signed separately:
+   *   1. buildInvest  → the four swaps (one Jito bundle, each self-contained);
+   *   2. buildDeposit → the deposit of exactly what the swaps delivered.
+   * Returns { txs, summary }. `amount` is in the stablecoin's base units. The
+   * summary's gas includes the deposit's, which stays in the user's wallet until
+   * step 2. lock: true → step 2 is a locked deposit (setup-cost rebate). */
   async function buildInvest({ user: userStr, stable: stableName, amount, tipAccount, lock = false }) {
     const user = PK(userStr);
     const R0 = await loadRent();
@@ -267,7 +273,7 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     const unitNew = !have[4];
 
     // Reserve the gas reimbursement first, then split the rest by vault value.
-    const est = [0, 1, 2, 3].map((i) => txCost(400000, (legNew[i] ? 1 : 0) + (lock && i === 0 && unitNew ? 1 : 0), 0, false))
+    const est = [0, 1, 2, 3].map((i) => txCost(400000, (legNew[i] ? 1 : 0) + (lock && i === 0 && unitNew ? 1 : 0), 0, i === 3))
       .concat([txCost(250000, !lock && unitNew ? 1 : 0, 0, true) + (lock ? R0.position : 0)]);
     const gas = est.map((l) => toStable(l, solUsd, stable));
     const gasTotal = gas.reduce((a, b) => a + b, 0n);
@@ -289,59 +295,106 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
       // create it here, where there's room, rather than at claim time.
       if (lock && i === 0) ixs.push(createAta(user, A.unitMint, P.token2022));
       ixs.push(parts[i].swap, reimburse(user, stable, gas[i]));
+      if (i === 3) ixs.push(tip(tipAccount));
       txs.push(await compile(user, ixs, alts, blockhash));
     }
-    // Deposit what the swaps are guaranteed to deliver (Jupiter's minimum out).
+    // An estimate for the review screen: what the swaps are guaranteed to deliver
+    // (Jupiter's minimum out), deposited. Step 2 deposits what actually arrived.
     const minOut = quotes.map((q) => BigInt(q.otherAmountThreshold));
     const supplyEff = f.supply; // fees are 0 at launch; the program charges any owed fee itself
     let k = null;
     for (let i = 0; i < 4; i++) { const r = (minOut[i] * 10n ** 18n) / f.holdings[i]; if (k === null || r < k) k = r; }
     const unitsMin = (k * supplyEff) / 10n ** 18n;
     const minUnitsOut = (unitsMin * 9900n) / 10000n;
-    let last;
     let bonus = 0n;
-    let positionId = null;
-    if (!lock) {
-      const depositIx = ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.deposit), ...minOut.map(u64le), u64le(minUnitsOut)));
-      last = [...budget(250000), createAta(user, A.unitMint, P.token2022), depositIx, reimburse(user, stable, gas[4]), tip(tipAccount)];
-    } else {
+    if (lock) {
       const b = f.bonus;
       if (!b || !b.on) throw new Error('locked investing is switched off');
       const [poolRaw] = await readRaw([pool]);
-      const poolBal = tokenAmount(poolRaw);
-      bonus = [(unitsMin * b.bp) / 10000n, b.max, poolBal].reduce((x, y) => (y < x ? y : x));
-      positionId = b.nextPosition;
-      const keys = [
-        meta(user, true, true), meta(A.vault, false, true), meta(A.unitMint, false, true),
-        meta(pool, false, true), meta(escrow, false, true), meta(positionPda(positionId), false, true),
-        ...A.legMints.map((m) => meta(m, false, false)), ...A.vaultLegs.map((v) => meta(v, false, true)),
-        ...A.legMints.map((m) => meta(ata(user, m, P.token2022), false, true)),
-        meta(P.token2022, false, false), meta(P.system, false, false), meta(A.feeAccount, false, true),
-      ];
-      const data = cat(Uint8Array.from(DISC.deposit_locked), ...minOut.map(u64le), u64le(minUnitsOut),
-        Uint8Array.from([b.lockDays & 0xff, b.lockDays >> 8]), u64le((bonus * 9900n) / 10000n));
-      // The position account's rent: the gas service gives it to the user here.
-      const rentGift = solTransfer(RELAYER, user, R0.position);
-      // No compute-budget instructions here: this transaction is the largest the
-      // router builds (1,249 bytes with them; the limit is 1,232). The default
-      // compute allowance covers deposit_locked (~83k), and the Jito tip, not a
-      // priority fee, gets the bundle included.
-      last = [rentGift, ix(A.program, keys, data), reimburse(user, stable, gas[4]), tip(tipAccount)];
+      bonus = [(unitsMin * b.bp) / 10000n, b.max, tokenAmount(poolRaw)].reduce((x, y) => (y < x ? y : x));
     }
-    txs.push(await compile(user, last, [], blockhash));
 
     return {
       txs,
       summary: {
         stable: stableName, amount: BigInt(amount), gas: gasTotal, spend, split,
         expectedLegs: quotes.map((q) => BigInt(q.outAmount)), minLegs: minOut,
-        minUnitsOut, solUsd, legUsd, lock, bonus, positionId,
+        minUnitsOut, solUsd, legUsd, lock, bonus,
         lockDays: lock ? f.bonus.lockDays : 0,
       },
     };
   }
 
+  /* Raw balances of the four stock tokens in the user's wallet (0 if no account). */
+  async function walletLegs(userStr) {
+    const user = PK(userStr);
+    return (await readRaw(A.legMints.map((m) => ata(user, m, P.token2022)))).map(tokenAmount);
+  }
+
+  /* Step 2 of investing, and the "add my stocks to the fund" button: deposit up to
+   * `amounts` (raw, per leg) of the user's stocks. The program takes the largest
+   * in-proportion slice; the rest stays in the wallet. Gas is repaid in `stable`. */
+  async function buildDeposit({ user: userStr, stable: stableName, amounts, tipAccount, lock = false }) {
+    const user = PK(userStr);
+    const R0 = await loadRent();
+    const stable = STABLES[stableName];
+    if (!stable) throw new Error('stable must be USDC or USDT');
+    const maxIn = amounts.map((a) => BigInt(a));
+    if (maxIn.some((a) => a <= 0n)) throw new Error('every stock must be above zero to deposit');
+    const f = await fund();
+    const [solUsd] = await prices([SOL_MINT]);
+    const userUnit = ata(user, A.unitMint, P.token2022);
+    const [stableOk, unitHave] = await exists([ata(RELAYER, PK(stable.mint), P.token), userUnit]);
+    if (!stableOk) throw new Error(`gas service has no ${stableName} account yet`);
+    let k = null;
+    for (let i = 0; i < 4; i++) { const r = (maxIn[i] * 10n ** 18n) / f.holdings[i]; if (k === null || r < k) k = r; }
+    const units = (k * f.supply) / 10n ** 18n;
+    if (units === 0n) throw new Error('too little to deposit');
+    const minUnitsOut = (units * 9900n) / 10000n;
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    let ixs;
+    let bonus = 0n;
+    let positionId = null;
+    if (!lock) {
+      const gas = toStable(txCost(250000, unitHave ? 0 : 1, 0, true), solUsd, stable);
+      const depositIx = ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.deposit), ...maxIn.map(u64le), u64le(minUnitsOut)));
+      ixs = [...budget(250000), createAta(user, A.unitMint, P.token2022), depositIx, reimburse(user, stable, gas)];
+      ixs.push(tip(tipAccount));
+      return { txs: [await compile(user, ixs, [], blockhash)], summary: { units, minUnitsOut, gas, lock } };
+    }
+    const b = f.bonus;
+    if (!b || !b.on) throw new Error('locked investing is switched off');
+    const [poolRaw] = await readRaw([pool]);
+    bonus = [(units * b.bp) / 10000n, b.max, tokenAmount(poolRaw)].reduce((x, y) => (y < x ? y : x));
+    positionId = b.nextPosition;
+    const gas = toStable(txCost(250000, 0, 0, true) + R0.position, solUsd, stable);
+    const keys = [
+      meta(user, true, true), meta(A.vault, false, true), meta(A.unitMint, false, true),
+      meta(pool, false, true), meta(escrow, false, true), meta(positionPda(positionId), false, true),
+      ...A.legMints.map((m) => meta(m, false, false)), ...A.vaultLegs.map((v) => meta(v, false, true)),
+      ...A.legMints.map((m) => meta(ata(user, m, P.token2022), false, true)),
+      meta(P.token2022, false, false), meta(P.system, false, false), meta(A.feeAccount, false, true),
+    ];
+    const data = cat(Uint8Array.from(DISC.deposit_locked), ...maxIn.map(u64le), u64le(minUnitsOut),
+      Uint8Array.from([b.lockDays & 0xff, b.lockDays >> 8]), u64le((bonus * 9900n) / 10000n));
+    // The position account's rent: the gas service gives it to the user here. No
+    // compute-budget instructions: this is the largest transaction the router
+    // builds (1,197 bytes), and the default allowance covers deposit_locked (~84k
+    // CU). No room to create the PAIF account here too: buildInvest's first swap
+    // creates it for a locked investment.
+    if (!unitHave) throw new Error('create the PAIF account first (a locked investment does this in its first step)');
+    ixs = [solTransfer(RELAYER, user, R0.position), ix(A.program, keys, data), reimburse(user, stable, gas), tip(tipAccount)];
+    return { txs: [await compile(user, ixs, [], blockhash)], summary: { units, minUnitsOut, gas, lock, bonus, positionId, lockDays: b.lockDays } };
+  }
+
   /* ------------------------------------------------------------ redeem */
+  /* Two signing steps (28 Nov), for the same reason as investing: the sales can't
+   * simulate until the redemption has delivered the stocks.
+   *   1. buildRedeem → hand back PAIF, receive the four stocks;
+   *   2. buildSell   → sell exactly what arrived for USDC/USDT (one Jito bundle).
+   * Step 1 is free when it creates no accounts (the gas service accepts a lone
+   * redeem, as it does a lone claim or exit); if the user has no stock accounts
+   * yet, step 1 creates them and repays their rent in `stable`. */
   async function buildRedeem({ user: userStr, stable: stableName, units, tipAccount }) {
     const user = PK(userStr);
     await loadRent();
@@ -351,43 +404,69 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     const [solUsd] = await prices([SOL_MINT]);
     const userLegs = A.legMints.map((m) => ata(user, m, P.token2022));
     const userUnit = ata(user, A.unitMint, P.token2022);
-    const userStable = ata(user, PK(stable.mint), P.token);
-    const [stableOk, stableHave, ...legsHave] = await exists([ata(RELAYER, PK(stable.mint), P.token), userStable, ...userLegs]);
+    const [stableOk, ...legsHave] = await exists([ata(RELAYER, PK(stable.mint), P.token), ...userLegs]);
     if (!stableOk) throw new Error(`gas service has no ${stableName} account yet`);
 
     // Exactly what redeem pays (the program's arithmetic): fee slice, then pro rata.
     const u = BigInt(units);
     const burned = u - (u * f.exitBp) / 10000n;
     const payout = f.holdings.map((h) => (h * burned) / f.supply);
-    // Sell slightly less than the payout so a small change in the vault between
-    // building and landing can't make a swap fail; the dust stays with the user.
-    const sell = payout.map((p) => (p * 9990n) / 10000n);
     const minOut = payout.map((p) => (p * 9950n) / 10000n);
-
-    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
-    const quotes = await Promise.all(sell.map((s, i) => quote(A.legMints[i].toBase58(), stable.mint, s.toString())));
-    const parts = await Promise.all(quotes.map((q) => swapInstructions(q, user)));
-
     const legNew = legsHave.map((x) => !x).filter(Boolean).length;
-    const gas0 = toStable(txCost(250000, legNew, 0, false), solUsd, stable);
-    const gasSwaps = [0, 1, 2, 3].map((i) => toStable(txCost(400000, 0, i === 0 && !stableHave ? 1 : 0, i === 3), solUsd, stable));
-    // The redeem transaction has no stablecoin yet; its gas is added to the first swap's.
-    gasSwaps[0] += gas0;
+    const ixs = [...budget(120000)];
+    if (legNew) A.legMints.forEach((m, i) => { if (!legsHave[i]) ixs.push(createAta(user, m, P.token2022)); });
+    ixs.push(ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.redeem), u64le(u), ...minOut.map(u64le))));
+    const gas = legNew ? toStable(txCost(120000, legNew, 0, true), solUsd, stable) : 0n;
+    if (legNew) ixs.push(reimburse(user, stable, gas));
+    ixs.push(tip(tipAccount));
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    // An estimate of the sale for the review screen (step 2 re-quotes what arrived).
+    let expected = null;
+    try {
+      const qs = await Promise.all(payout.map((p, i) => (p > 0n ? quote(A.legMints[i].toBase58(), stable.mint, p.toString()) : null)));
+      expected = qs.reduce((a, q) => a + (q ? BigInt(q.outAmount) : 0n), 0n);
+    } catch { expected = null; }
+    const sellGas = [0, 1, 2, 3].map((i) => toStable(txCost(400000, 0, 0, i === 3), solUsd, stable)).reduce((a, b) => a + b, 0n);
+    const totalGas = gas + sellGas;
+    return { txs: [await compile(user, ixs, [], blockhash)],
+      summary: { stable: stableName, units: u, payout, minOut, gas: totalGas, expected, net: expected === null ? null : expected - totalGas, solUsd, free: !legNew } };
+  }
 
-    const redeemIx = ix(A.program, userMetas(user, userUnit), cat(Uint8Array.from(DISC.redeem), u64le(u), ...minOut.map(u64le)));
-    const first = [...budget(250000), ...A.legMints.map((m) => createAta(user, m, P.token2022)), redeemIx];
-    const txs = [await compile(user, first, [], blockhash)];
-    for (let i = 0; i < 4; i++) {
-      const alts = await lookupTables(parts[i].alts);
-      const ixs = [...budget(parts[i].cu)];
-      if (i === 0) ixs.push(createAta(user, PK(stable.mint), P.token));
-      ixs.push(parts[i].swap, reimburse(user, stable, gasSwaps[i]));
-      if (i === 3) ixs.push(tip(tipAccount));
+  /* Step 2 of withdrawing, and the "sell the stocks in my wallet" button: sell
+   * `amounts` (raw, per leg; zeros skipped) for `stable`, each sale repaying its gas. */
+  async function buildSell({ user: userStr, stable: stableName, amounts, tipAccount }) {
+    const user = PK(userStr);
+    await loadRent();
+    const stable = STABLES[stableName];
+    if (!stable) throw new Error('stable must be USDC or USDT');
+    const sellAll = amounts.map((a) => BigInt(a));
+    const legs = [0, 1, 2, 3].filter((i) => sellAll[i] > 0n);
+    if (!legs.length) throw new Error('nothing to sell');
+    const [solUsd] = await prices([SOL_MINT]);
+    const userStable = ata(user, PK(stable.mint), P.token);
+    const [stableOk, stableHave] = await exists([ata(RELAYER, PK(stable.mint), P.token), userStable]);
+    if (!stableOk) throw new Error(`gas service has no ${stableName} account yet`);
+    const quotes = await Promise.all(legs.map((i) => quote(A.legMints[i].toBase58(), stable.mint, sellAll[i].toString())));
+    const parts = await Promise.all(quotes.map((q) => swapInstructions(q, user)));
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    const txs = [];
+    let gasTotal = 0n;
+    for (const [n, i] of legs.entries()) {
+      const last = n === legs.length - 1;
+      const gas = toStable(txCost(Math.min(1_400_000, Math.ceil(parts[n].cu * 1.2) + 30_000), 0, n === 0 && !stableHave ? 1 : 0, last), solUsd, stable);
+      // A sale can't repay more than it brings in; the first sale also pays for a
+      // new stablecoin account, so it must clear that.
+      if (BigInt(quotes[n].otherAmountThreshold) <= gas) throw new Error('too little of a stock to sell after network fees');
+      gasTotal += gas;
+      const alts = await lookupTables(parts[n].alts);
+      const ixs = [...budget(parts[n].cu)];
+      if (n === 0) ixs.push(createAta(user, PK(stable.mint), P.token));
+      ixs.push(parts[n].swap, reimburse(user, stable, gas));
+      if (last) ixs.push(tip(tipAccount));
       txs.push(await compile(user, ixs, alts, blockhash));
     }
     const expected = quotes.reduce((a, q) => a + BigInt(q.outAmount), 0n);
-    const gas = gasSwaps.reduce((a, b) => a + b, 0n);
-    return { txs, summary: { stable: stableName, units: u, payout, sell, expected, gas, net: expected - gas, solUsd } };
+    return { txs, summary: { stable: stableName, sell: sellAll, expected, gas: gasTotal, net: expected - gasTotal, solUsd } };
   }
 
   /* ------------------------------------------------------- claim / exit */
@@ -407,5 +486,5 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     return { txs: [await compile(user, ixs, [], blockhash)] };
   }
 
-  return { buildInvest, buildRedeem, buildSettle, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64, positionPda };
+  return { buildInvest, buildDeposit, buildRedeem, buildSell, buildSettle, walletLegs, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64, positionPda };
 }

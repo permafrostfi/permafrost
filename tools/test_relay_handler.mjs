@@ -28,6 +28,7 @@ const rpcSrv = await serve(async (req, res) => {
   const b = await body(req);
   const j = JSON.parse(b);
   const up = await (await fetch(MAINNET, { method: 'POST', headers: { 'content-type': 'application/json' }, body: b })).json();
+  if (j.method === 'isBlockhashValid' && globalThis.__expire) { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ jsonrpc: '2.0', id: j.id, result: { value: false } })); }
   if (j.method === 'getMultipleAccounts') {
     j.params[0].forEach((k, i) => { if (k === rUSDC) up.result.value[i] = { data: ['', 'base64'], owner: TOKEN.toBase58(), lamports: 2039280, executable: false }; });
   }
@@ -74,14 +75,20 @@ if (captured) {
     const msg = t.message.serialize();
     return t.message.staticAccountKeys.slice(0, 2).every((k, i) => ed25519.verify(t.signatures[i], msg, k.toBytes()));
   });
-  ok(sent.length === 5 && allValid, 'Jito receives 5 transactions, each validly signed by gas wallet and user');
+  ok(sent.length === 4 && allValid, 'Jito receives the 4 swap transactions (invest step 1), each validly signed by gas wallet and user');
 }
 const tampered = txs.map((t) => Buffer.from(t.serialize()).toString('base64'));
-const bad = web3.VersionedTransaction.deserialize(Buffer.from(tampered[4], 'base64'));
+const bad = web3.VersionedTransaction.deserialize(Buffer.from(tampered[3], 'base64'));
 bad.message.compiledInstructions.at(-1).data[4] = 0xff; // inflate the tip after the user signed
-tampered[4] = Buffer.from(bad.serialize()).toString('base64');
+tampered[3] = Buffer.from(bad.serialize()).toString('base64');
 const t2 = await call('POST', { txs: tampered });
 ok(t2.code === 400, 'refuses a bundle altered after the user signed (tip inflated)', t2.body.error);
+
+globalThis.__expire = true;
+const before = captured;
+const ex = await call('POST', { txs: txs.map((t) => Buffer.from(t.serialize()).toString('base64')) });
+ok(ex.code === 409 && ex.body.error === 'expired' && /expired/.test(ex.body.message) && captured === before, 'an expired blockhash is refused with a plain "expired" answer, nothing sent to Jito', ex.body.message);
+globalThis.__expire = false;
 
 rpcSrv.close(); jitoSrv.close();
 console.log(failures ? `\n${failures} FAILED` : '\nall checks passed');

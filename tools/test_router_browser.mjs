@@ -36,10 +36,14 @@ const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.json': 'applic
 const site = await new Promise((done) => {
   const s = http.createServer(async (req, res) => {
     // Like the live site's /api/rpc: the public endpoint refuses browser origins.
-    if (req.url === '/rpc') {
+    if (req.url === '/rpc' || req.url.startsWith('/api/rpc')) {
       let b = ''; for await (const c of req) b += c;
       const up = await fetch(RPC, { method: 'POST', headers: { 'content-type': 'application/json' }, body: b });
       res.writeHead(up.status, { 'content-type': 'application/json' }); return res.end(await up.text());
+    }
+    if (req.url.startsWith('/api/relay')) {   // the page's own load(); not under test here
+      res.writeHead(200, { 'content-type': 'application/json' });
+      return res.end(JSON.stringify({ relayer: RELAYER, tipAccount: TIP, stableAccounts: {} }));
     }
     let p = join(SITE, new URL(req.url, 'http://x').pathname);
     if (existsSync(p) && statSync(p).isDirectory()) p = join(p, 'index.html');
@@ -67,10 +71,13 @@ const built = await page.evaluate(async ({ USER, RELAYER, TIP, addresses }) => {
     try { const r = await f(); out[name] = { txs: enc(r.txs), solUsd: r.summary ? Number(r.summary.solUsd) : null }; }
     catch (e) { out[name] = { error: `${e.message}\n${(e.stack || '').split('\n').slice(0, 4).join('\n')}` }; }
   };
-  await run('invest USDC', () => router.buildInvest({ user: USER, stable: 'USDC', amount: 20_000_000n, tipAccount: TIP }));
-  await run('invest USDT', () => router.buildInvest({ user: USER, stable: 'USDT', amount: 20_000_000n, tipAccount: TIP }));
-  await run('invest USDC locked', () => router.buildInvest({ user: USER, stable: 'USDC', amount: 20_000_000n, tipAccount: TIP, lock: true }));
-  await run('redeem to USDC', () => router.buildRedeem({ user: USER, stable: 'USDC', units: 10_000_000_000n, tipAccount: TIP }));
+  const amounts = [438495n, 236149n, 130634n, 103738n];   // about $0.65 of each
+  await run('invest USDC (step 1: swaps)', () => router.buildInvest({ user: USER, stable: 'USDC', amount: 20_000_000n, tipAccount: TIP }));
+  await run('invest USDT (step 1: swaps)', () => router.buildInvest({ user: USER, stable: 'USDT', amount: 20_000_000n, tipAccount: TIP }));
+  await run('invest USDC locked (step 1: swaps)', () => router.buildInvest({ user: USER, stable: 'USDC', amount: 20_000_000n, tipAccount: TIP, lock: true }));
+  await run('deposit (invest step 2)', () => router.buildDeposit({ user: USER, stable: 'USDC', amounts, tipAccount: TIP }));
+  await run('redeem (withdraw step 1)', () => router.buildRedeem({ user: USER, stable: 'USDC', units: 10_000_000_000n, tipAccount: TIP }));
+  await run('sell to USDC (withdraw step 2)', () => router.buildSell({ user: USER, stable: 'USDC', amounts, tipAccount: TIP }));
   await run('claim', () => router.buildSettle({ user: USER, positionId: 0n, kind: 'claim', tipAccount: TIP }));
   await run('exit', () => router.buildSettle({ user: USER, positionId: 0n, kind: 'exit', tipAccount: TIP }));
   return out;
@@ -97,6 +104,7 @@ for (const [name, r] of Object.entries(built)) {
   const txs = r.txs.map((b) => web3.VersionedTransaction.deserialize(Buffer.from(b, 'base64')));
   ok(txs.every((t) => t.serialize().length <= 1232), 'every transaction fits', txs.map((t) => t.serialize().length).join(' / ') + ' bytes');
   if (name.startsWith('invest')) {
+    ok(txs.length === 4, 'four swap transactions, no deposit (that is step 2)', String(txs.length));
     for (let i = name.includes('locked') ? 1 : 0; i < 4; i++) {
       const s = await rpc('simulateTransaction', [r.txs[i], { encoding: 'base64', sigVerify: false, replaceRecentBlockhash: true, commitment: 'confirmed' }]);
       const v = s.result?.value;
@@ -104,10 +112,15 @@ for (const [name, r] of Object.entries(built)) {
       ok(!err, `swap ${i} simulates on mainnet`, err ? `${err} ${(v?.logs || []).slice(-2).join(' | ')}` : `${v.unitsConsumed.toLocaleString()} CU`);
     }
   }
-  if (!name.startsWith('redeem')) {
+  {
     try {
       const a = await alts(txs);
-      const c = check(txs, { relayer: RELAYER, programId: addresses.programId, tipAccounts: new Set([TIP]), stableAccounts, solUsd: r.solUsd || 70 }, (k) => a[k], new Set(), web3);
+      // Like the gas service: accounts the bundle "creates" that already exist cost nothing.
+      const targets = [...new Set(txs.flatMap((t) => { const k = t.message.staticAccountKeys.map((x) => x.toBase58());
+        return t.message.compiledInstructions.filter((ci) => k[ci.programIdIndex] === 'ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL').map((ci) => k[ci.accountKeyIndexes[1]]); }))];
+      const existing = new Set();
+      if (targets.length) (await rpc('getMultipleAccounts', [targets, { encoding: 'base64', dataSlice: { offset: 0, length: 0 } }])).result.value.forEach((v, i) => { if (v) existing.add(targets[i]); });
+      const c = check(txs, { relayer: RELAYER, programId: addresses.programId, tipAccounts: new Set([TIP]), stableAccounts, solUsd: r.solUsd || 70 }, (k) => a[k], existing, web3);
       ok(true, 'gas service accepts it', c.freeSettle ? 'free (lone claim/exit)' : `paid $${c.paidUsd.toFixed(4)} ≥ need $${c.needUsd.toFixed(4)}`);
     } catch (e) { ok(false, 'gas service accepts it', e.message); }
   }

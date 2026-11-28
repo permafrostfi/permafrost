@@ -301,11 +301,14 @@ async function refresh() {
       s: SHADE[i % 4],
     }));
   }
+  lastPrices = prices;
   if (wallet) {
     try { holder = await readHolder(rpc, addresses, wallet.toBase58()); } catch { holder = null; }
+    try { walletLegs = router ? await router.walletLegs(wallet.toBase58()) : null; } catch { walletLegs = null; }
   }
   render();
 }
+let lastPrices = {}, walletLegs = null;
 
 /* ========== flows ========== */
 async function connect() {
@@ -341,6 +344,7 @@ async function review(kind) {
         user: wallet.toBase58(), stable: coin, amount: amt,
         tipAccount: relayInfo.tipAccount, lock: false,
       });
+      built.args = { coin, amount: amt, lock: false };
     } else {
       const units = toBase(wAmt, 9);
       if (units === 0n || !holder || units > holder.rawUnits) {
@@ -349,6 +353,7 @@ async function review(kind) {
       built = await router.buildRedeem({
         user: wallet.toBase58(), stable: wCoin, units, tipAccount: relayInfo.tipAccount,
       });
+      built.args = { coin: wCoin, units };
     }
     built.kind = kind;
   } catch (e) {
@@ -357,40 +362,131 @@ async function review(kind) {
   busy = false; render();
 }
 
+/* Sign → Phantom → gas service → confirmed. Returns the signatures. One
+   transaction goes to Phantom's signTransaction, several to signAllTransactions. */
+async function submit(txs, say) {
+  const signed = txs.length === 1
+    ? [await provider().signTransaction(txs[0])]
+    : await provider().signAllTransactions(txs);
+  say('sending…');
+  const enc = signed.map((t) => btoa(String.fromCharCode(...t.serialize())));
+  const r = await (await fetch('/api/relay', {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ txs: enc }),
+  })).json();
+  if (r.error === 'expired') throw new Error('prices expired before sending (over a minute passed). nothing was sent. press sign again for fresh prices.');
+  if (r.error) throw new Error(r.error);
+  say('sent. confirming…');
+  const sigs = r.signatures;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((ok) => setTimeout(ok, 1500));
+    const v = (await rpc.call('getSignatureStatuses', [sigs])).value;
+    if (v.every((x) => x && (x.confirmationStatus === 'confirmed' || x.confirmationStatus === 'finalized'))) {
+      if (v.some((x) => x.err)) throw new Error('a transaction failed on chain.');
+      return sigs;
+    }
+  }
+  throw new Error('not confirmed within a minute. nothing was taken unless every transaction in that step landed &mdash; check your wallet, then try again.');
+}
+const declined = (e) => /reject|declin/i.test(e?.message || '');
+
+/* Two Phantom approvals per action (28 Nov). Phantom checks each transaction on
+   its own and warns "this dapp could be malicious" when one can't be checked —
+   and the deposit (or the sales) can't be checked until the swaps (or the
+   redemption) have landed. So: step 1, then step 2 built from what arrived.
+   Each step is rebuilt when it is signed, so its prices are fresh. */
 async function sign() {
   if (!built) return;
-  busy = true; statusCls = ''; statusHtml = 'waiting for phantom…'; render();
+  const kind = built.kind, args = built.args;
+  const user = wallet.toBase58();
+  busy = true; statusCls = '';
+  const say = (t) => { statusHtml = t; render(); };
+  let stage = 1;
   try {
-    const signed = await provider().signAllTransactions(built.txs);
-    statusHtml = 'sending…'; render();
-    const enc = signed.map((t) => btoa(String.fromCharCode(...t.serialize())));
-    const r = await (await fetch('/api/relay', {
-      method: 'POST', headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ txs: enc }),
-    })).json();
-    if (r.error) throw new Error(r.error);
-    statusHtml = 'sent. confirming…'; render();
-    const sigs = r.signatures;
-    for (let i = 0; i < 40; i++) {
+    const before = await router.walletLegs(user);
+    say('step 1 of 2 &middot; getting fresh prices…');
+    const one = kind === 'invest'
+      ? await router.buildInvest({ user, stable: args.coin, amount: args.amount, tipAccount: relayInfo.tipAccount, lock: args.lock })
+      : await router.buildRedeem({ user, stable: args.coin, units: args.units, tipAccount: relayInfo.tipAccount });
+    say(kind === 'invest' ? 'step 1 of 2 &middot; approve buying the four stocks in phantom…'
+      : 'step 1 of 2 &middot; approve handing back your units in phantom…');
+    await submit(one.txs, (t) => say('step 1 of 2 &middot; ' + t));
+    stage = 2;
+    // Exactly what step 1 delivered (the wallet may hold other stock tokens too).
+    let got = null;
+    for (let i = 0; i < 10; i++) {
+      const after = await router.walletLegs(user);
+      got = after.map((a, j) => (a > before[j] ? a - before[j] : 0n));
+      if (kind === 'invest' ? got.every((g) => g > 0n) : got.some((g) => g > 0n)) break;
       await new Promise((ok) => setTimeout(ok, 1500));
-      const v = (await rpc.call('getSignatureStatuses', [sigs])).value;
-      if (v.every((x) => x && (x.confirmationStatus === 'confirmed' || x.confirmationStatus === 'finalized'))) {
-        if (v.some((x) => x.err)) throw new Error('a transaction failed on chain.');
-        statusCls = 'ok';
-        statusHtml = 'done. <a href="https://solscan.io/tx/' + sigs[sigs.length - 1]
-          + '" target="_blank" rel="noopener noreferrer">view on solscan</a>';
-        built = null; amount = ''; wAmt = ''; busy = false;
-        await refresh();
-        return;
-      }
     }
-    statusCls = 'bad';
-    statusHtml = 'not confirmed within a minute. nothing was taken unless every step landed '
-      + '&mdash; check your wallet, then try again with fresh prices.';
+    say('step 2 of 2 &middot; getting fresh prices…');
+    const two = kind === 'invest'
+      ? await router.buildDeposit({ user, stable: args.coin, amounts: got, tipAccount: relayInfo.tipAccount, lock: args.lock })
+      : await router.buildSell({ user, stable: args.coin, amounts: got, tipAccount: relayInfo.tipAccount });
+    say(kind === 'invest' ? 'step 2 of 2 &middot; approve adding the stocks to the fund in phantom…'
+      : 'step 2 of 2 &middot; approve selling the stocks for ' + args.coin.toLowerCase() + ' in phantom…');
+    const sigs = await submit(two.txs, (t) => say('step 2 of 2 &middot; ' + t));
+    statusCls = 'ok';
+    statusHtml = 'done. <a href="https://solscan.io/tx/' + sigs[sigs.length - 1]
+      + '" target="_blank" rel="noopener noreferrer">view on solscan</a>';
+    built = null; amount = ''; wAmt = ''; busy = false;
+    await refresh();
+    return;
   } catch (e) {
-    statusCls = 'bad';
-    statusHtml = /reject/i.test(e.message || '')
-      ? 'you declined in phantom. nothing was sent.' : esc(e.message || e);
+    const msg = declined(e) ? 'you declined in phantom. nothing was sent in this step.' : esc(e.message || e);
+    if (stage === 2) {
+      statusCls = 'bad';
+      statusHtml = msg + '<br>step 1 went through, so the four stock tokens are in your wallet. '
+        + 'use <b>stock tokens in your wallet</b> below to ' + (kind === 'invest' ? 'add them to the fund.' : 'sell them.');
+      built = null; busy = false;
+      await refresh();
+      return;
+    }
+    statusCls = 'bad'; statusHtml = msg;
+  }
+  busy = false; render();
+}
+
+/* Stock tokens in the wallet, e.g. when step 2 of an investment or withdrawal
+   didn't happen (declined, closed, expired). Hidden below $1 (rounding crumbs). */
+function leftoverUsd() {
+  if (!walletLegs || !fund || !fund.legs) return null;
+  const each = walletLegs.map((raw, i) => (Number(raw) / 1e8) * (lastPrices[fund.legs[i].mint] || 0));
+  return { each, total: each.reduce((a, b) => a + b, 0) };
+}
+function leftoverBlock() {
+  const lo = leftoverUsd();
+  if (!wallet || !lo || lo.total < 1 || built) return '';
+  const allFour = walletLegs.every((r) => r > 0n);
+  const c = (route === 'withdraw' ? wCoin : coin).toLowerCase();
+  return '<div class="pick"><h3>stock tokens in your wallet</h3>'
+    + '<p>about ' + usd(lo.total) + ' of the fund\'s stock tokens' + (allFour ? '' : ' (not all four)')
+    + ' are in your wallet, for example from a step 2 that didn\'t finish. nothing is lost.</p>'
+    + (allFour ? btn('add them to the fund', busy ? ' disabled' : ' data-loadd') : '')
+    + btn('sell them for ' + c, busy ? ' disabled' : ' data-losell') + '</div>';
+}
+async function leftover(kind) {
+  const lo = leftoverUsd();
+  if (!lo) return;
+  busy = true; statusCls = '';
+  const say = (t) => { statusHtml = t; render(); };
+  try {
+    say('getting fresh prices…');
+    const user = wallet.toBase58();
+    const b = kind === 'add'
+      ? await router.buildDeposit({ user, stable: coin, amounts: walletLegs, tipAccount: relayInfo.tipAccount })
+      // Skip crumbs worth less than a sale's network fee.
+      : await router.buildSell({ user, stable: route === 'withdraw' ? wCoin : coin, amounts: walletLegs.map((r, i) => (lo.each[i] >= 0.15 ? r : 0n)), tipAccount: relayInfo.tipAccount });
+    say('approve in phantom…');
+    const sigs = await submit(b.txs, say);
+    statusCls = 'ok';
+    statusHtml = 'done. <a href="https://solscan.io/tx/' + sigs[sigs.length - 1] + '" target="_blank" rel="noopener noreferrer">view on solscan</a>';
+    busy = false;
+    await refresh();
+    return;
+  } catch (e) {
+    statusCls = 'bad'; statusHtml = declined(e) ? 'you declined in phantom. nothing was sent.' : esc(e.message || e);
   }
   busy = false; render();
 }
@@ -467,6 +563,7 @@ function investPane() {
       + (priced && priced.priced
         ? '<div class="r"><span>worth about</span><span>' + usd(units * priced.navPerUnit) + '</span></div>' : '')
       + '</div>'
+      + '<p class="fn">phantom asks twice: 1 &middot; buy the four stocks, 2 &middot; add them to the fund.</p>'
       + '<div class="go">' + btn(busy ? 'working…' : 'sign in phantom', busy ? ' disabled' : ' data-sign') + '</div>'
       + '<button class="back" data-cancel>&larr; change the amount</button>'
       + statusBlock();
@@ -480,7 +577,7 @@ function investPane() {
     + '<p class="bal">minimum 5 ' + coin.toLowerCase() + ' &middot; prices and routes are fetched when you review</p></div>'
     + '<div class="go">' + btn(busy ? 'getting prices…' : 'review investment',
       busy || !amount ? ' disabled' : ' data-review="invest"') + '</div>'
-    + statusBlock();
+    + statusBlock() + leftoverBlock();
 }
 
 function withdrawPane() {
@@ -496,11 +593,12 @@ function withdrawPane() {
       + '<div class="est">'
       + '<div class="r"><span>you hand back</span><span>' + num(wAmt || 0, 4) + ' units</span></div>'
       + '<div class="r"><span>network fees</span><span>&minus;' + num(Number(s.gas) / 1e6, 2) + '</span></div>'
-      + '<div class="r key"><span>you receive about</span><span>' + num(Number(s.net) / 1e6, 2) + ' ' + wCoin.toLowerCase() + '</span></div>'
+      + '<div class="r key"><span>you receive about</span><span>' + (s.net === null ? '—' : num(Number(s.net) / 1e6, 2)) + ' ' + wCoin.toLowerCase() + '</span></div>'
       /* Decision 13: units carry no purchase record on chain. */
       + '<div class="r unk"><span>cost of these units</span><span>unknown</span></div>'
       + '<div class="r unk"><span>return on this withdrawal</span><span>unknown</span></div>'
-      + '<p class="fn">each stock sale is protected against price moves of more than 1%.</p></div>'
+      + '<p class="fn">each stock sale is protected against price moves of more than 1%. '
+      + 'phantom asks twice: 1 &middot; hand back your units for the four stocks, 2 &middot; sell them.</p></div>'
       + '<div class="go">' + btn(busy ? 'working…' : 'sign in phantom', busy ? ' disabled' : ' data-sign') + '</div>'
       + '<button class="back" data-cancel>&larr; change the amount</button>'
       + statusBlock();
@@ -525,7 +623,7 @@ function withdrawPane() {
     + '</div>'
     + '<div class="go">' + btn(busy ? 'getting prices…' : 'review withdrawal',
       busy || !wAmt || over || held === 0 ? ' disabled' : ' data-review="withdraw"') + '</div>'
-    + statusBlock();
+    + statusBlock() + leftoverBlock();
 }
 
 const L = $('left'), Rt = $('right');
@@ -583,6 +681,8 @@ function wire() {
   on('[data-connect]', connect);
   on('[data-disc]', disconnect);
   on('[data-sign]', sign);
+  on('[data-loadd]', () => leftover('add'));
+  on('[data-losell]', () => leftover('sell'));
   on('[data-cancel]', () => { built = null; statusHtml = ''; render(); });
   on('[data-review="invest"]', () => review('invest'));
   on('[data-review="withdraw"]', () => review('withdraw'));

@@ -16,8 +16,11 @@
  *
  * Then it prices what the bundle costs the gas service and refuses unless the
  * stablecoin paid to the gas service's own USDC/USDT accounts covers it — except
- * a lone claim or exit of a locked position (one per position, so bounded), which
- * the gas service pays for: the user may hold no stablecoin at that point.
+ * a lone claim, exit or redeem that creates no accounts, which the gas service pays
+ * for (a few thousand lamports): the user may hold no stablecoin at that point.
+ * A redeem burns PAIF, and getting PAIF back costs a paid deposit, so free redeems
+ * can't be farmed. (Redeem became its own signing step on 28 Nov: Phantom warns
+ * when a transaction in a batch can't simulate on its own.)
  */
 
 export const LIMITS = {
@@ -35,6 +38,7 @@ const DISC = {
   deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141],
   claim_locked: [34, 206, 181, 23, 11, 207, 147, 90],
   exit_locked: [207, 93, 52, 157, 105, 252, 90, 187],
+  redeem: [184, 12, 86, 149, 70, 196, 97, 225],
 };
 const isIx = (data, name) => data.length >= 8 && DISC[name].every((b, i) => data[i] === b);
 
@@ -136,7 +140,7 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
         refuse(`tx ${t} ix ${n}: system transfer must be gas key → Jito tip, or the position rent to the user`);
       }
       if (usesR.length) refuse(`tx ${t} ix ${n}: gas key used by ${kind}`);
-      if (kind === 'permafrost' && (isIx(d, 'claim_locked') || isIx(d, 'exit_locked'))) settles++;
+      if (kind === 'permafrost' && (isIx(d, 'claim_locked') || isIx(d, 'exit_locked') || isIx(d, 'redeem'))) settles++;
       else others++;
       if (kind === 'token') {
         // Count TransferChecked (12) into the gas service's own stable accounts.
@@ -157,7 +161,7 @@ export function check(txs, ctx, resolveAlts, existing, web3) {
 
   const needUsd = (cost / 1e9) * ctx.solUsd * LIMITS.MARGIN;
   const paidUsd = Number(paidBase) / 10 ** STABLE_DECIMALS;
-  // A lone claim or exit, with nothing else that costs anything, rides free.
+  // A lone claim, exit or redeem, with nothing else that costs anything, rides free.
   const freeSettle = txs.length === 1 && settles === 1 && others === 0 && created.size === 0 && userGifts === 0;
   if (!freeSettle && paidUsd + 1e-9 < needUsd) refuse(`reimbursement $${paidUsd.toFixed(4)} below cost $${needUsd.toFixed(4)}`);
   return { user, costLamports: cost, paidUsd, needUsd, blockhash, freeSettle };

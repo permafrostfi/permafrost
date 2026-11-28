@@ -1,4 +1,8 @@
-/* The app page's locked-deposit screens, end to end, against a LOCAL validator.
+/* NOTE (28 Nov): written for the pre-design app page (commit 9cb78b7). The approved
+ * design (3784f91) has no lock screens yet — the bonus is off at launch — so this test
+ * applies again once lock screens are added to the design.
+ *
+ * The app page's locked-deposit screens, end to end, against a LOCAL validator.
  *
  * Real pieces: the app page, chain.js, router.js (buildSettle), the gas service
  * (site/api/relay.js) and the RPC proxy (site/api/rpc.js), the devnet build of the
@@ -113,6 +117,7 @@ const MOCK = `
 window.phantom = { solana: {
   isPhantom: true,
   async connect() { return { publicKey: { toString: () => '${user.publicKey.toBase58()}' } }; },
+  async signTransaction(t) { return (await this.signAllTransactions([t]))[0]; },
   async signAllTransactions(txs) {
     const kp = solanaWeb3.Keypair.fromSecretKey(Uint8Array.from(${JSON.stringify([...user.secretKey])}));
     for (const t of txs) t.sign([kp]);

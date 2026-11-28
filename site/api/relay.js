@@ -114,6 +114,13 @@ export default async function handler(req, res) {
       solUsd: await solUsd(),
     }, (k) => tables[k], existing);
 
+    // A blockhash lives ~60–90 s. If the user took longer than that in Phantom, say
+    // so plainly (the app rebuilds with fresh prices) instead of passing Jito's error on.
+    const fresh = await rpc('isBlockhashValid', [result.blockhash, { commitment: 'processed' }]);
+    if (fresh && fresh.value === false) {
+      return res.status(409).json({ error: 'expired', message: 'The prices expired before sending (over a minute passed). Nothing was sent.' });
+    }
+
     // Every transaction must already carry the user's VALID signature over exactly
     // what was checked — so nothing can be altered after the user agreed to it.
     for (const t of txs) {
@@ -125,7 +132,15 @@ export default async function handler(req, res) {
     }
     for (const t of txs) t.signatures[0] = kp().sign(t.message.serialize());
     const encoded = txs.map((t) => Buffer.from(t.serialize()).toString('base64'));
-    const bundleId = await jito('sendBundle', [encoded, { encoding: 'base64' }]);
+    let bundleId;
+    try {
+      bundleId = await jito('sendBundle', [encoded, { encoding: 'base64' }]);
+    } catch (e) {
+      if (/expired blockhash|blockhash not found/i.test(String(e.message))) {
+        return res.status(409).json({ error: 'expired', message: 'The prices expired before sending (over a minute passed). Nothing was sent.' });
+      }
+      throw e;
+    }
     const signatures = txs.map((t) => bs58.encode(Buffer.from(t.signatures[0])));
     return res.status(200).json({ bundleId, signatures, ...result });
   } catch (e) {

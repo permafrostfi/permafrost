@@ -94,7 +94,7 @@ expectRefused('six transactions', () => run([...good(), ...good(), ...good()]), 
 expectRefused('a compute-budget heap request', () => run([tx([ix(new PublicKey('ComputeBudget111111111111111111111111111111'), [], [1, 0, 0, 1, 0]), reimburse(250000), tip()])]), 'compute-budget');
 
 console.log('locked bonus: position rent and free claim / exit');
-const disc = { deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141], claim_locked: [34, 206, 181, 23, 11, 207, 147, 90], exit_locked: [207, 93, 52, 157, 105, 252, 90, 187] };
+const disc = { deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141], claim_locked: [34, 206, 181, 23, 11, 207, 147, 90], exit_locked: [207, 93, 52, 157, 105, 252, 90, 187], redeem: [184, 12, 86, 149, 70, 196, 97, 225], deposit: [242, 35, 198, 137, 82, 225, 242, 182] };
 const ourIx = (name) => ix(PROGRAM, [m(U.publicKey, true, true), m(Keypair.generate().publicKey, false, true)], [...disc[name], 0, 0]);
 const gift = (lamports = 1_061_720, to = U.publicKey) => SystemProgram.transfer({ fromPubkey: R.publicKey, toPubkey: to, lamports });
 expectOk('locked deposit: gas key gives the user the position rent, reimbursed', () => run([tx([...budget(), gift(), ourIx('deposit_locked'), reimburse(400000), tip()])]));
@@ -106,6 +106,11 @@ expectOk('a lone claim rides free (no stablecoin needed)', () => { const r = run
 expectOk('a lone exit rides free', () => run([tx([...budget(), ourIx('exit_locked'), tip()])]));
 expectRefused('claim plus a swap, unpaid', () => run([tx([...budget(), ourIx('claim_locked'), jupSwap(), tip()])]), 'below cost');
 expectRefused('claim plus a new token account, unpaid', () => run([tx([...budget(), createAta(R.publicKey, U.publicKey, M.publicKey), ourIx('claim_locked'), tip()])]), 'below cost');
+expectOk('a lone redeem rides free (withdraw step 1, 28 Nov)', () => { const r = run([tx([...budget(), ourIx('redeem'), tip()])]); if (!r.freeSettle) throw new Error('not free'); return r; });
+expectRefused('redeem that creates token accounts, unpaid', () => run([tx([...budget(), createAta(R.publicKey, U.publicKey, M.publicKey), ourIx('redeem'), tip()])]), 'below cost');
+expectOk('redeem that creates token accounts, reimbursed', () => run([tx([...budget(), createAta(R.publicKey, U.publicKey, M.publicKey), ourIx('redeem'), reimburse(400000), tip()])]));
+expectRefused('redeem plus a swap, unpaid (the old one-bundle withdraw)', () => run([tx([...budget(), ourIx('redeem'), tip()]), tx([...budget(), jupSwap()])]), 'below cost');
+expectRefused('a lone deposit, unpaid', () => run([tx([...budget(), ourIx('deposit'), tip()])]), 'below cost');
 expectRefused('two claims in a two-transaction bundle, unpaid', () => run([tx([...budget(), ourIx('claim_locked'), tip()]), tx([...budget(), ourIx('claim_locked')])]), 'below cost');
 
 console.log(`\n${pass} passed, ${fail} failed`);
