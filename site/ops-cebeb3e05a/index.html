@@ -257,6 +257,24 @@ const explorer = (sig, net) => `https://solscan.io/tx/${sig}${net.cluster?"?clus
 
 // ---------------------------------------------------------------- state
 let netKey = "devnet", net, conn, A = null, wallet = null, chain = {};
+
+// The gas service (site/api/relay.js) pays investors' network fees and is repaid in
+// USDC/USDT. Its wallet must never run dry: /api/relay names it, and the ledger
+// shows its balances with a LOW warning. Mainnet only: the gas wallet is a mainnet
+// account. Thresholds: SOL below 0.1 (≈ a few hundred investments) or either
+// stablecoin below $5 (it should only ever grow).
+const GAS_LOW_SOL = 0.1, GAS_LOW_STABLE = 5;
+const STABLE_NAMES = { EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v: "USDC", Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB: "USDT" };
+let gasInfo = null;   // { relayer, stableAccounts: { account: mint } } from /api/relay, read once
+async function loadGasInfo(){
+  if(gasInfo !== null) return gasInfo;
+  try{
+    const r = await fetch("/api/relay", { cache: "no-store" });
+    const j = await r.json();
+    gasInfo = j && j.relayer ? j : false;
+  }catch{ gasInfo = false; }
+  return gasInfo;
+}
 const ALL_OUT = ["init","seed","v3","cap","disc","fund","pool","fees","admin","upg"];
 const ALL_ST = ["init","seed","v3","cap","disc","pool","fees","admin","upg"];
 function provider(){ return (window.phantom && window.phantom.solana) || (window.solana && window.solana.isPhantom ? window.solana : null); }
@@ -301,7 +319,13 @@ async function refresh(){
   try{
     const keys = [A.programData, A.vault, A.unitMint, A.deadUnits, A.pool, A.escrow, A.feeAccount, ...A.vaultLegs];
     if(wallet) keys.push(wallet, ...A.mints.map(m => A.ata(wallet, m)), A.ata(wallet, A.unitMint));
-    const accs = await conn.getMultipleAccountsInfo(keys);
+    // Gas wallet (mainnet only): its SOL account plus its USDC and USDT accounts.
+    const gas = netKey === "mainnet" ? await loadGasInfo() : false;
+    const gasKeys = gas ? [PK(gas.relayer), ...Object.keys(gas.stableAccounts || {}).map(PK)] : [];
+    const nMain = keys.length;
+    keys.push(...gasKeys);
+    const accsAll = await conn.getMultipleAccountsInfo(keys);
+    const accs = accsAll.slice(0, nMain), gasAccs = accsAll.slice(nMain);
     if(seq !== refreshSeq) return;
     const [pd, v, um, du, pl, es, fa, ...rest] = accs;
     const vl = rest.slice(0,4), w = wallet ? rest[4] : null, wl = wallet ? rest.slice(5,9) : [null,null,null,null];
@@ -347,6 +371,25 @@ async function refresh(){
       rows.push(["Fee account", `<span class="mono">${A.feeAccount.toBase58()}</span> · ${fmt(chain.feeUnits,9)} units`]);
     }
     if(wallet) rows.push(["Your wallet", `${(chain.sol/1e9).toLocaleString("en-US",{maximumFractionDigits:4})} SOL · ${fmt(chain.walletUnits,9)} PAIF`]);
+    if(netKey === "mainnet"){
+      if(!gas){
+        rows.push(["Gas wallet", `<span class="pill warn">unknown</span> The gas service did not answer (/api/relay). Investing may be down.`]);
+      }else{
+        const sol = (gasAccs[0] ? gasAccs[0].lamports : 0) / 1e9;
+        const stables = Object.keys(gas.stableAccounts || {}).map((acct, i) => {
+          const name = STABLE_NAMES[gas.stableAccounts[acct]] || gas.stableAccounts[acct].slice(0,4);
+          const amt = Number(bal(gasAccs[i+1])) / 1e6;
+          return { name, amt, low: amt < GAS_LOW_STABLE };
+        });
+        const lowSol = sol < GAS_LOW_SOL;
+        const anyLow = lowSol || stables.some(x => x.low);
+        const pill = anyLow ? '<span class="pill bad">LOW — top up</span>' : '<span class="pill ok">ok</span>';
+        const parts = [`${sol.toLocaleString("en-US",{maximumFractionDigits:4})} SOL${lowSol?' <b class="bad">(low)</b>':''}`]
+          .concat(stables.map(x => `${x.amt.toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})} ${x.name}${x.low?' <b class="bad">(low)</b>':''}`));
+        rows.push(["Gas wallet", `${pill} <span class="mono">${esc(gas.relayer)}</span> · ${parts.join(" · ")}`
+          + (anyLow ? `<br><span class="bad">Send SOL to the address above. It pays every investor's network fees; below ${GAS_LOW_SOL} SOL new investments start failing.</span>` : '')]);
+      }
+    }
     L.innerHTML = rows.map(([k,v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
     T.querySelector("tbody").innerHTML = LEGS.map((l,i) => `<tr><td>${l}</td><td class="mono">${A.mints[i].toBase58().slice(0,6)}…</td><td class="num">${fmt(chain.holdings[i],LEG_DEC)}</td><td class="num">${wallet?fmt(chain.walletLegs[i],LEG_DEC):"—"}</td></tr>`).join("");
     T.hidden = false;
