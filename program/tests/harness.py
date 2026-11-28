@@ -880,3 +880,8 @@ def _init_with_v4(self, *a, **k):
 
 
 World.__init__ = _init_with_v4
+
+
+def lookup_addresses(data: bytes):
+    """Addresses in an address-lookup-table account (56-byte header, then 32 each)."""
+    return [Pubkey(data[o:o + 32]) for o in range(56, len(data) - 31, 32)]
