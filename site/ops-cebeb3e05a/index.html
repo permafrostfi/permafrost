@@ -648,6 +648,12 @@ $("do-upg").onclick = async () => {
   const bAuth = acc.data[4] === 1 ? new W.PublicKey(acc.data.slice(5,37)) : null;
   if(!bAuth || !bAuth.equals(wallet)){ out.innerHTML = `<p class="bad">The buffer's authority is ${bAuth?bAuth.toBase58():"none"}, not your wallet. Ask Claude to hand it over first.</p>`; return; }
   const code = acc.data.slice(37);
+  // The program's data account must have room for the new code (it is sized at the
+  // first deploy; a bigger program needs `solana program extend` first, which anyone
+  // may pay for — a bigger v4 did, 28 Nov).
+  const pd = await conn.getAccountInfo(A.programData);
+  const room = pd ? pd.data.length - 45 : 0;
+  if(code.length > room){ out.innerHTML = `<p class="bad">The program's data account holds ${room.toLocaleString("en-US")} bytes but this code is ${code.length.toLocaleString("en-US")}. Ask Claude to extend it first (solana program extend); then simulate again.</p>`; return; }
   const digest = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", code))).map(b=>b.toString(16).padStart(2,"0")).join("");
   run("upg", () => [ixUpgrade(buf)], `This replaces the program's code with the buffer's (${code.length.toLocaleString("en-US")} bytes, SHA-256 <span class="mono">${digest.slice(0,16)}…</span>; compare with the hash Claude gave you). The buffer's rent returns to your wallet.`);
 };
