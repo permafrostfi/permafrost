@@ -235,7 +235,7 @@ const FEE_OWNER = PK("E3FTvAEzUU8v91cFCbykxQzcqRo7Zc2Jp3HxtwTZmYyt");
 const ZERO = new W.PublicKey(new Uint8Array(32));
 const VAULT_DISC = [228,196,82,165,98,210,235,152];
 const UNIT = 1_000_000_000n, LEG_DEC = 8, UNIT_DEC = 9;
-const MAX_CAP_UNITS = 50_000n; // E1: not above 50,000 until custody improves
+const MAX_CAP_UNITS = 500_000n; // E1 (~$50k ceiling until custody improves). 28 Nov: the mainnet seed is $2.60 for 25 PAIF (~$0.10/PAIF), so the ceiling in units is 500,000.
 
 // ---------------------------------------------------------------- small helpers
 const $ = id => document.getElementById(id);
@@ -518,7 +518,7 @@ function explainErr(err, logs){
 $("do-init").onclick = () => run("init", () => {
   const cap = BigInt($("init-cap").value.trim() || "0");
   if(cap <= 0n) throw new Error("Enter a cap above zero.");
-  if(cap > MAX_CAP_UNITS) throw new Error("The agreed launch cap is at most 50,000 units.");
+  if(cap > MAX_CAP_UNITS) throw new Error("The agreed launch cap is at most 500,000 units (about $50k at launch prices).");
   return [ixInitialize(cap)];
 }, `This sets up the vault with a cap of ${Number($("init-cap").value||0).toLocaleString("en-US")} units, name “${esc($("init-name").value)}” and symbol “${esc($("init-symbol").value)}”. It costs about 0.02 SOL in account rent.`);
 
@@ -532,7 +532,7 @@ $("do-seed").onclick = () => {
 $("do-cap").onclick = () => run("cap", () => {
   const cap = BigInt(($("cap-new").value||"").trim().replace(/,/g,"") || "0");
   if(cap <= 0n) throw new Error("Enter a cap above zero.");
-  if(cap > MAX_CAP_UNITS) throw new Error("Agreed: no cap above 50,000 units until custody improves.");
+  if(cap > MAX_CAP_UNITS) throw new Error("Agreed: no cap above 500,000 units (about $50k) until custody improves.");
   return [ixSetCap(cap)];
 }, `This changes the deposit cap to ${Number(($("cap-new").value||"0").replace(/,/g,"")).toLocaleString("en-US")} units.`);
 $("do-v3").onclick = () => run("v3", () => [ixInitV3()],
