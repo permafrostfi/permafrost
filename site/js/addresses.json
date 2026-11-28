@@ -1,0 +1,25 @@
+{
+  "network": "mainnet",
+  "programId": "EDp2AwfRiWEbM3K1bF5SY5SJGcFTjBZRPENKXk7Eoy61",
+  "vault": "p2LZebVEieKgQUxmEdSwVFKAwKHjf1CobksbdKFQdQt",
+  "unitMint": "DAehWqFcR9gqNzh2YX6PhRQP6289HKqEHYE1ND73gC1W",
+  "deadOwner": "6wGxsMVdheLt1yesCLZFH5sS31um5yivCG6fsicKErR3",
+  "deadUnits": "EMcnAPgF8tPpHhXDCteH9UbyyR45rNQnWoox25k4VW9D",
+  "vaultLegs": [
+    "CAsVFa81wKa9JUh2EAGjTS1TS5EPuSn9YKYncYj3Apr3",
+    "Bjnm49NX1EqjfcY3QrUsQhZi9kbJfJS7r6HV7W3jACwN",
+    "2VCm3aJsy8Y7V6oQkQH3WMfDS8H8iy3ak2m6j3MMBtb5",
+    "CgjMvmiDacCYibvPAbnEz15MjtVK2CDqnkfHEr3cY9zy"
+  ],
+  "legSymbols": [
+    "nvdax",
+    "googlx",
+    "msftx",
+    "metax"
+  ],
+  "pool": "5dngEVYATA5xVf4y8iNCXAw8ZcwSHTaL4tSrWqhvggCm",
+  "escrow": "6WQt9NDhL86SQxaDAiveJVrGn8LGu3TLPFr5RTnTtK1n",
+  "feeOwner": "E3FTvAEzUU8v91cFCbykxQzcqRo7Zc2Jp3HxtwTZmYyt",
+  "feeAccount": "7fDfJYKTdL7EeePFATgB3KhaeLM2sYXFyJrC7kFZT9zc",
+  "tokenProgram": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
+}
