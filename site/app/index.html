@@ -548,14 +548,17 @@ function statsBlock() {
 }
 
 function holdsList() {
-  if (!HOLD.length || !HOLD[0].p) return '';
+  /* Gate on the fund, not on the prices: with the feed down the table still
+     has to appear, because below 1120 it is the only place the holdings are
+     shown. Unpriced legs read as a dash. */
+  if (!fund || !fund.initialized || !HOLD.length) return '';
   return '<ul class="holds">'
     + '<li class="hh"><i></i><span class="tk">stock</span>'
     + '<span class="wt">% of fund</span><span class="pr">$ value</span></li>'
     + HOLD.map((h) =>
       '<li><i style="background:var(' + h.s + ')"></i><span class="tk">' + h.t
       + '</span><span class="wt">' + h.w.toFixed(1) + '%</span><span class="pr">'
-      + h.p + '</span></li>').join('') + '</ul>';
+      + (h.p || '\u2014') + '</span></li>').join('') + '</ul>';
 }
 
 function investPane() {
@@ -767,7 +770,11 @@ function skyFrame() {
   const W = SW, H = SH, NR = W < 861;
   const HZ = H * (NR ? 0.68 : 0.825);
   const VS = (NR ? Math.min(H * 0.50, W * 0.95) : Math.min(H, W * 0.62)) * 0.74;
-  const labR = Math.min(W, H) * 0.235, labels = !NR && !(route !== 'home' && wallet);
+  /* Below 1120 the radial labels run under the figures box -- measured, the
+     last collision is at 1080 -- so the holdings table in the left column
+     carries them instead; its swatches are the same four wedge colours. */
+  const labR = Math.min(W, H) * 0.235;
+  const labels = W >= 1120 && !(route !== 'home' && wallet);
   const sunX = W * (NR ? 0.62 : 0.70), sunY = H * (NR ? 0.40 : 0.375);
   const sunR = Math.min(W, H) * (NR ? 0.05 : 0.042);
   sx.fillStyle = paper; sx.fillRect(0, 0, W, H);
