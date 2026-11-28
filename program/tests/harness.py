@@ -612,3 +612,271 @@ IDX = dict(user=0, vault=1, unit_mint=2, user_unit=3,
            vault_leg0=8, vault_leg1=9, vault_leg2=10, vault_leg3=11,
            user_leg0=12, user_leg1=13, user_leg2=14, user_leg3=15,
            token_program=16)
+
+
+# ====================================================================== v4
+# Orders: invest with a stablecoin / withdraw to a stablecoin, one signature.
+# PF_MOCK=1 → the `mockswap` build (SWAP_PROGRAM = the mock), and the mock swap
+# program is installed in each World. Tests create the real USDC mint address
+# with a test mint authority, so the program's STABLE_MINTS check passes.
+import random  # noqa: E402
+
+MOCK = os.environ.get("PF_MOCK") == "1"
+if MOCK:
+    PROGRAM_SO = ROOT / "target" / "deploy-mock" / "permafrost.so"
+MOCK_SO = ROOT / "target" / "deploy-mock" / "mockswap.so"
+MOCK_SWAP = Pubkey.from_string("E9KwSa1oVgko2b3AqLsD8zU3ppKWhth12U8tnFWNpXzG")
+JUPITER = Pubkey.from_string("JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4")
+SWAP_PROGRAM = MOCK_SWAP if MOCK else JUPITER
+MOCK_POOL = pda([b"pool"], MOCK_SWAP)
+TOKEN = Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA")
+USDC = Pubkey.from_string("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v")
+USDT = Pubkey.from_string("Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB")
+STABLE_DECIMALS = 6
+STABLE_AUTH = det_keypair("stable-mint-authority")
+KIND_INVEST, KIND_REDEEM = 0, 1
+
+ERR.update({n: 6000 + 28 + i for i, n in enumerate([
+    "BadStableMint", "BadExpiry", "BadBudget", "BadLeg", "OrderExpired", "OrderNotExpired",
+    "LegAlreadyFilled", "LegNotFilled", "BudgetExceeded", "FillBelowMinimum", "OrderDrained",
+    "NotSwapProgram", "FeeAboveMax", "BadOrderKind",
+])})
+
+
+def ata_classic(owner: Pubkey, mint: Pubkey) -> Pubkey:
+    return Pubkey.find_program_address([bytes(owner), bytes(TOKEN), bytes(mint)], ATA_PROGRAM)[0]
+
+
+def order_pda(owner: Pubkey, oid: int) -> Pubkey:
+    return pda([b"order", bytes(owner), struct.pack("<Q", oid)])
+
+
+def order_accounts(owner: Pubkey, oid: int, stable: Pubkey = USDC) -> dict:
+    o = order_pda(owner, oid)
+    return {"order": o, "stable": ata_classic(o, stable), "legs": [ata(o, m) for m in LEG_MINTS]}
+
+
+def decode_order(d: bytes) -> dict:
+    """Order account layout (Anchor): disc 8 | kind u8 | bump u8 | filled u8 | owner 32 |
+    payer 32 | stable_mint 32 | id u64 | amount_in u64 | max_fee u64 | min_units u64 |
+    min_out 4×u64 | budget 4×u64 | created_at i64 | expires_at i64."""
+    o = 8
+    kind, bump, filled = d[o], d[o + 1], d[o + 2]
+    o += 3
+    owner, payer, stable = Pubkey(d[o:o + 32]), Pubkey(d[o + 32:o + 64]), Pubkey(d[o + 64:o + 96])
+    o += 96
+    oid, amount_in, max_fee, min_units = struct.unpack_from("<4Q", d, o)
+    o += 32
+    min_out = struct.unpack_from("<4Q", d, o); o += 32
+    budget = struct.unpack_from("<4Q", d, o); o += 32
+    created_at, expires_at = struct.unpack_from("<2q", d, o)
+    return dict(kind=kind, bump=bump, filled=filled, owner=owner, payer=payer, stable=stable, id=oid,
+                amount_in=amount_in, max_fee=max_fee, min_units=min_units, min_out=list(min_out),
+                budget=list(budget), created_at=created_at, expires_at=expires_at)
+
+
+ORDER_SIZE = 8 + 3 + 96 + 32 + 32 + 32 + 16
+
+
+class OrdersMixin:
+    """Mixed into World below (kept apart so the v1/v3 harness reads unchanged)."""
+
+    def install_v4(self):
+        if MOCK:
+            self.svm.add_program(MOCK_SWAP, MOCK_SO.read_bytes())
+        self.svm.airdrop(STABLE_AUTH.pubkey(), 10 * 10**9)
+        for m in (USDC, USDT):
+            self.create_stable_mint(m)
+
+    def create_stable_mint(self, mint: Pubkey):
+        # Classic SPL mint, 82 bytes: mint_authority COption, supply, decimals, initialized, freeze COption.
+        data = struct.pack("<I32sQB?I32s", 1, bytes(STABLE_AUTH.pubkey()), 0, STABLE_DECIMALS, True, 0, bytes(32))
+        assert len(data) == 82
+        self.svm.set_account(mint, Account(self.svm.minimum_balance_for_rent_exemption(82), data, TOKEN, False))
+
+    def create_ata_classic_ix(self, payer: Pubkey, owner: Pubkey, mint: Pubkey) -> Instruction:
+        return Instruction(ATA_PROGRAM, bytes([1]), [
+            AccountMeta(payer, True, True), AccountMeta(ata_classic(owner, mint), False, True),
+            AccountMeta(owner, False, False), AccountMeta(mint, False, False),
+            AccountMeta(SYSTEM, False, False), AccountMeta(TOKEN, False, False),
+        ])
+
+    def mint_stable(self, owner: Pubkey, amount: int, mint: Pubkey = USDC, payer: Keypair | None = None):
+        payer = payer or STABLE_AUTH
+        ixs = [self.create_ata_classic_ix(payer.pubkey(), owner, mint)]
+        if amount:
+            ixs.append(Instruction(TOKEN, bytes([14]) + struct.pack("<QB", amount, STABLE_DECIMALS), [
+                AccountMeta(mint, False, True), AccountMeta(ata_classic(owner, mint), False, True),
+                AccountMeta(STABLE_AUTH.pubkey(), True, False)]))
+        r = self.send(ixs, [payer, STABLE_AUTH] if payer is not STABLE_AUTH else [STABLE_AUTH])
+        assert r.ok, r.reason()
+        return ata_classic(owner, mint)
+
+    def stable_balance(self, owner: Pubkey, mint: Pubkey = USDC) -> int:
+        return self.balance(ata_classic(owner, mint))
+
+    # ---- the mock's liquidity: pool PDA token accounts, funded by the test
+    def fund_mock_pool(self, legs, stable: int, mint: Pubkey = USDC):
+        self.mint_stable(MOCK_POOL, stable, mint)
+        ixs = [self.create_ata_ix(STABLE_AUTH.pubkey(), MOCK_POOL, m) for m in LEG_MINTS]
+        r = self.send(ixs, [STABLE_AUTH])
+        assert r.ok, r.reason()
+        mix = [Instruction(TOKEN_2022, bytes([14]) + struct.pack("<QB", amt, LEG_DECIMALS), [
+            AccountMeta(m, False, True), AccountMeta(ata(MOCK_POOL, m), False, True), AccountMeta(ISSUER.pubkey(), True, False)])
+            for m, amt in zip(LEG_MINTS, legs) if amt]
+        if mix:
+            r = self.send(mix, [ISSUER])
+            assert r.ok, r.reason()
+
+    # ---- builders
+    def ix_order_invest(self, user: Keypair, payer: Keypair, oid: int, amount: int, budget, min_out,
+                        min_units=0, max_fee=0, expires_at=None, stable: Pubkey = USDC, override=None) -> Instruction:
+        expires_at = self.now() + 600 if expires_at is None else expires_at
+        oa = order_accounts(user.pubkey(), oid, stable)
+        metas = [
+            AccountMeta(user.pubkey(), True, False), AccountMeta(payer.pubkey(), True, True),
+            AccountMeta(oa["order"], False, True),
+            AccountMeta(stable, False, False), AccountMeta(ata_classic(user.pubkey(), stable), False, True),
+            AccountMeta(oa["stable"], False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False), AccountMeta(SYSTEM, False, False),
+        ]
+        data = anchor_disc("order_invest") + struct.pack("<QQ4Q4QQQq", oid, amount, *budget, *min_out, min_units, max_fee, expires_at)
+        return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    def ix_order_redeem(self, user: Keypair, payer: Keypair, oid: int, units: int, min_out=(0, 0, 0, 0),
+                        max_fee=0, expires_at=None, stable: Pubkey = USDC, override=None) -> Instruction:
+        expires_at = self.now() + 600 if expires_at is None else expires_at
+        oa = order_accounts(user.pubkey(), oid, stable)
+        metas = [
+            AccountMeta(user.pubkey(), True, False), AccountMeta(payer.pubkey(), True, True),
+            AccountMeta(oa["order"], False, True),
+            AccountMeta(VAULT, False, True), AccountMeta(UNIT_MINT, False, True),
+            AccountMeta(ata(user.pubkey(), UNIT_MINT), False, True), AccountMeta(FEE_ACCOUNT, False, True),
+            AccountMeta(stable, False, False), AccountMeta(oa["stable"], False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(v, False, True) for v in VAULT_LEGS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False), AccountMeta(SYSTEM, False, False),
+        ]
+        data = anchor_disc("order_redeem") + struct.pack("<QQ4QQq", oid, units, *min_out, max_fee, expires_at)
+        return Instruction(PROGRAM_ID, data, _apply(metas, override))
+
+    def mock_swap_metas(self, order: Pubkey, src: Pubkey, dst: Pubkey, src_mint: Pubkey, dst_mint: Pubkey):
+        """The mock's accounts for a swap by `order`: src/dst are the escrow's accounts."""
+        src_prog = TOKEN if src_mint in (USDC, USDT) else TOKEN_2022
+        dst_prog = TOKEN if dst_mint in (USDC, USDT) else TOKEN_2022
+        pool_src = ata_classic(MOCK_POOL, src_mint) if src_prog == TOKEN else ata(MOCK_POOL, src_mint)
+        pool_dst = ata_classic(MOCK_POOL, dst_mint) if dst_prog == TOKEN else ata(MOCK_POOL, dst_mint)
+        return [
+            AccountMeta(order, False, False),   # the escrow signs via CPI; not a tx-level signer
+            AccountMeta(src, False, True), AccountMeta(dst, False, True),
+            AccountMeta(pool_src, False, True), AccountMeta(pool_dst, False, True),
+            AccountMeta(MOCK_POOL, False, False),
+            AccountMeta(src_mint, False, False), AccountMeta(dst_mint, False, False),
+            AccountMeta(src_prog, False, False), AccountMeta(dst_prog, False, False),
+        ]
+
+    def mock_swap_data(self, amount_in: int, amount_out: int) -> bytes:
+        return hashlib.sha256(b"global:swap").digest()[:8] + struct.pack("<QQ", amount_in, amount_out)
+
+    def ix_fill_leg(self, filler: Keypair, owner: Pubkey, oid: int, leg: int, amount_in: int, amount_out: int,
+                    stable: Pubkey = USDC, swap_metas=None, swap_data=None, swap_program=None, override=None) -> Instruction:
+        """A fill through the MOCK: buy (invest) or sell (redeem) `leg` at the given amounts.
+        swap_metas / swap_data override the forwarded accounts and data — for the attack tests."""
+        oa = order_accounts(owner, oid, stable)
+        od = decode_order(self.account_data(oa["order"]))
+        li = min(leg, 3)  # leg ≥ 4 is for the program to refuse; use leg 0's accounts to get there
+        if od["kind"] == KIND_INVEST:
+            src, dst, sm, dm = oa["stable"], oa["legs"][li], stable, LEG_MINTS[li]
+        else:
+            src, dst, sm, dm = oa["legs"][li], oa["stable"], LEG_MINTS[li], stable
+        swap_metas = self.mock_swap_metas(oa["order"], src, dst, sm, dm) if swap_metas is None else swap_metas
+        swap_data = self.mock_swap_data(amount_in, amount_out) if swap_data is None else swap_data
+        metas = [
+            AccountMeta(filler.pubkey(), True, False), AccountMeta(oa["order"], False, True),
+            AccountMeta(stable, False, False), AccountMeta(oa["stable"], False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            AccountMeta(swap_program or SWAP_PROGRAM, False, False),
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+        ]
+        data = anchor_disc("fill_leg") + bytes([leg]) + struct.pack("<I", len(swap_data)) + swap_data
+        return Instruction(PROGRAM_ID, data, _apply(metas, override) + list(swap_metas))
+
+    def ix_settle_invest(self, settler: Keypair, owner: Pubkey, oid: int, fee: int = 0, fee_to=None,
+                         stable: Pubkey = USDC, override=None) -> Instruction:
+        oa = order_accounts(owner, oid, stable)
+        od = decode_order(self.account_data(oa["order"]))
+        metas = [
+            AccountMeta(settler.pubkey(), True, True), AccountMeta(oa["order"], False, True),
+            AccountMeta(owner, False, False), AccountMeta(od["payer"], False, True),
+            AccountMeta(VAULT, False, True), AccountMeta(UNIT_MINT, False, True),
+            AccountMeta(ata(owner, UNIT_MINT), False, True), AccountMeta(FEE_ACCOUNT, False, True),
+            AccountMeta(stable, False, False), AccountMeta(oa["stable"], False, True),
+            AccountMeta(ata_classic(owner, stable), False, True),
+            AccountMeta(fee_to or ata_classic(settler.pubkey(), stable), False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(v, False, True) for v in VAULT_LEGS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False), AccountMeta(SYSTEM, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc("settle_invest") + struct.pack("<Q", fee), _apply(metas, override))
+
+    def ix_settle_redeem(self, settler: Keypair, owner: Pubkey, oid: int, fee: int = 0, fee_to=None,
+                         stable: Pubkey = USDC, override=None) -> Instruction:
+        oa = order_accounts(owner, oid, stable)
+        od = decode_order(self.account_data(oa["order"]))
+        metas = [
+            AccountMeta(settler.pubkey(), True, True), AccountMeta(oa["order"], False, True),
+            AccountMeta(owner, False, False), AccountMeta(od["payer"], False, True),
+            AccountMeta(VAULT, False, False),
+            AccountMeta(stable, False, False), AccountMeta(oa["stable"], False, True),
+            AccountMeta(ata_classic(owner, stable), False, True),
+            AccountMeta(fee_to or ata_classic(settler.pubkey(), stable), False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(v, False, True) for v in VAULT_LEGS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False), AccountMeta(SYSTEM, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc("settle_redeem") + struct.pack("<Q", fee), _apply(metas, override))
+
+    def ix_cancel_order(self, canceller: Keypair, owner: Pubkey, oid: int, stable: Pubkey = USDC, override=None) -> Instruction:
+        oa = order_accounts(owner, oid, stable)
+        od = decode_order(self.account_data(oa["order"]))
+        metas = [
+            AccountMeta(canceller.pubkey(), True, True), AccountMeta(oa["order"], False, True),
+            AccountMeta(owner, False, False), AccountMeta(od["payer"], False, True),
+            AccountMeta(stable, False, False), AccountMeta(oa["stable"], False, True),
+            AccountMeta(ata_classic(owner, stable), False, True),
+            *[AccountMeta(m, False, False) for m in LEG_MINTS],
+            *[AccountMeta(l, False, True) for l in oa["legs"]],
+            *[AccountMeta(ata(owner, m), False, True) for m in LEG_MINTS],
+            AccountMeta(TOKEN, False, False), AccountMeta(TOKEN_2022, False, False),
+            AccountMeta(ATA_PROGRAM, False, False), AccountMeta(SYSTEM, False, False),
+        ]
+        return Instruction(PROGRAM_ID, anchor_disc("cancel_order"), _apply(metas, override))
+
+    def order(self, owner: Pubkey, oid: int) -> dict | None:
+        d = self.account_data(order_pda(owner, oid))
+        return None if d is None else decode_order(d)
+
+
+# Graft the v4 methods onto World and run install_v4 after its constructor.
+for _name, _fn in list(vars(OrdersMixin).items()):
+    if callable(_fn) and not _name.startswith("__"):
+        setattr(World, _name, _fn)
+_orig_init = World.__init__
+
+
+def _init_with_v4(self, *a, **k):
+    _orig_init(self, *a, **k)
+    self.install_v4()
+
+
+World.__init__ = _init_with_v4

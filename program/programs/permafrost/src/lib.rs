@@ -42,6 +42,9 @@ use anchor_spl::token_2022_extensions::token_metadata::{
 use anchor_spl::token_interface::{self, Burn, Mint, MintTo, TokenAccount, TransferChecked};
 use permafrost_core as pf;
 
+pub mod orders;
+use orders::*;
+
 // Mainnet and devnet are separate deployments with separate program ids.
 #[cfg(not(feature = "devnet"))]
 declare_id!("EDp2AwfRiWEbM3K1bF5SY5SJGcFTjBZRPENKXk7Eoy61");
@@ -784,6 +787,315 @@ pub mod permafrost {
         });
         Ok(())
     }
+
+    // =============================================================== v4
+
+    /// Open an invest order: escrow `amount` of a stablecoin against a plan the
+    /// user signed — per leg, the most to spend and the least stock to get; the
+    /// fewest units to accept overall; the most the settler may keep as its fee.
+    #[allow(clippy::too_many_arguments)]
+    pub fn order_invest(
+        mut ctx: Context<OrderInvest>,
+        id: u64,
+        amount: u64,
+        budget: [u64; 4],
+        min_out: [u64; 4],
+        min_units: u64,
+        max_fee: u64,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(amount > 0, PfErr::ZeroAmount);
+        require!(expires_at >= now + MIN_ORDER_LIFE && expires_at <= now + MAX_ORDER_LIFE, PfErr::BadExpiry);
+        let mut planned: u64 = max_fee;
+        for b in budget {
+            require!(b > 0, PfErr::BadBudget);
+            planned = planned.checked_add(b).ok_or(PfErr::Overflow)?;
+        }
+        require!(planned <= amount, PfErr::BadBudget);
+
+        let a = &mut ctx.accounts;
+        xfer(
+            a.stable_token_program.to_account_info(),
+            a.user_stable.to_account_info(),
+            a.stable_mint.to_account_info(),
+            a.order_stable.to_account_info(),
+            a.user.to_account_info(),
+            amount,
+            a.stable_mint.decimals,
+            None,
+        )?;
+        let o = &mut a.order;
+        o.kind = KIND_INVEST;
+        o.bump = ctx.bumps.order;
+        o.filled = 0;
+        o.owner = a.user.key();
+        o.payer = a.payer.key();
+        o.stable_mint = a.stable_mint.key();
+        o.id = id;
+        o.amount_in = amount;
+        o.max_fee = max_fee;
+        o.min_units = min_units;
+        o.min_out = min_out;
+        o.budget = budget;
+        o.created_at = now;
+        o.expires_at = expires_at;
+        emit!(OrderOpened { order: o.key(), owner: o.owner, kind: KIND_INVEST, amount_in: amount, expires_at });
+        Ok(())
+    }
+
+    /// Open a redeem order: hand back `units` now (exactly `redeem`'s arithmetic,
+    /// fee included) and escrow the four payouts for sale; `min_out` is the least
+    /// stablecoin each leg's sale must bring.
+    pub fn order_redeem(
+        mut ctx: Context<OrderRedeem>,
+        id: u64,
+        units: u64,
+        min_out: [u64; 4],
+        max_fee: u64,
+        expires_at: i64,
+    ) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        require!(expires_at >= now + MIN_ORDER_LIFE && expires_at <= now + MAX_ORDER_LIFE, PfErr::BadExpiry);
+        let a = &mut ctx.accounts;
+        let streamed = settle_fees(&mut a.vault, a.unit_mint.supply, now)?;
+        let holdings = [a.vault_leg0.amount, a.vault_leg1.amount, a.vault_leg2.amount, a.vault_leg3.amount];
+        let supply = a.unit_mint.supply.checked_add(streamed).ok_or(PfErr::Overflow)?;
+        let mut v = pf::Vault::new(holdings.map(u128::from), supply as u128);
+        v.exit_bp = a.vault.exit_bp as u128;
+        let r = pf::redeem(&mut v, units as u128).map_err(core_err)?;
+        let burned = u64::try_from(r.burned).map_err(|_| PfErr::Overflow)?;
+        let fee = u64::try_from(r.to_creator).map_err(|_| PfErr::Overflow)?;
+        let mut paid = [0u64; 4];
+        for i in 0..4 {
+            paid[i] = u64::try_from(r.payouts[i]).map_err(|_| PfErr::Overflow)?;
+        }
+        token_interface::burn(
+            CpiContext::new(
+                a.token_program.to_account_info(),
+                Burn { mint: a.unit_mint.to_account_info(), from: a.user_unit.to_account_info(), authority: a.user.to_account_info() },
+            ),
+            burned,
+        )?;
+        if fee > 0 {
+            transfer(&a.token_program, a.user_unit.to_account_info(), a.unit_mint.to_account_info(),
+                a.fee_account.to_account_info(), a.user.to_account_info(), fee, UNIT_DECIMALS, None)?;
+        }
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, streamed)?;
+        let bump = [a.vault.vault_bump];
+        let seeds: &[&[&[u8]]] = &[&[VAULT_SEED, &bump]];
+        let mints = [&a.mint0, &a.mint1, &a.mint2, &a.mint3];
+        let from = [&a.vault_leg0, &a.vault_leg1, &a.vault_leg2, &a.vault_leg3];
+        let to = [&a.order_leg0, &a.order_leg1, &a.order_leg2, &a.order_leg3];
+        let mut filled = 0u8;
+        for i in 0..4 {
+            if paid[i] > 0 {
+                transfer(&a.token_program, from[i].to_account_info(), mints[i].to_account_info(),
+                    to[i].to_account_info(), a.vault.to_account_info(), paid[i], mints[i].decimals, Some(seeds))?;
+            } else {
+                filled |= 1 << i; // nothing to sell for this leg
+            }
+        }
+        let o = &mut a.order;
+        o.kind = KIND_REDEEM;
+        o.bump = ctx.bumps.order;
+        o.filled = filled;
+        o.owner = a.user.key();
+        o.payer = a.payer.key();
+        o.stable_mint = a.stable_mint.key();
+        o.id = id;
+        o.amount_in = units;
+        o.max_fee = max_fee;
+        o.min_units = 0;
+        o.min_out = min_out;
+        o.budget = paid;
+        o.created_at = now;
+        o.expires_at = expires_at;
+        emit!(Redeemed { user: o.owner, units, paid, supply_after: supply - burned });
+        emit!(OrderOpened { order: o.key(), owner: o.owner, kind: KIND_REDEEM, amount_in: units, expires_at });
+        Ok(())
+    }
+
+    /// Fill one leg of an open order through the swap program. Anyone may call.
+    /// `data` is the swap instruction's data; the swap's accounts are the
+    /// remaining accounts. See orders.rs for what is checked around the call.
+    pub fn fill_leg<'info>(mut ctx: Context<'_, '_, 'info, 'info, FillLeg<'info>>, leg: u8, data: Vec<u8>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let leg = usize::from(leg);
+        require!(leg < 4, PfErr::BadLeg);
+        let a = &mut ctx.accounts;
+        require!(now < a.order.expires_at, PfErr::OrderExpired);
+        require!(a.order.filled & (1 << leg) == 0, PfErr::LegAlreadyFilled);
+        let order_key = a.order.key();
+        let owner = a.order.owner;
+        let id = a.order.id.to_le_bytes();
+        let bump = [a.order.bump];
+        let seeds: &[&[&[u8]]] = &[&[ORDER_SEED, owner.as_ref(), &id, &bump]];
+        let (in_ix, out_ix) = if a.order.kind == KIND_INVEST { (0, leg + 1) } else { (leg + 1, 0) };
+        let max_spend = a.order.budget[leg];
+        let min_receive = a.order.min_out[leg];
+        let mut escrow = [&mut a.order_stable, &mut a.order_leg0, &mut a.order_leg1, &mut a.order_leg2, &mut a.order_leg3];
+        let (spent, got) = guarded_swap(
+            &a.swap_program.to_account_info(),
+            ctx.remaining_accounts,
+            data,
+            order_key,
+            seeds,
+            &mut escrow,
+            in_ix,
+            out_ix,
+            max_spend,
+            min_receive,
+        )?;
+        a.order.filled |= 1 << leg;
+        emit!(LegFilled { order: order_key, leg: leg as u8, spent, got });
+        Ok(())
+    }
+
+    /// Finish an invest order whose four legs are filled: the bought stock goes
+    /// into the vault at the vault's own deposit arithmetic (leftovers above the
+    /// binding leg stay in the vault), units are minted to the owner — at least
+    /// `min_units` or nothing happens — the settler keeps `fee` ≤ `max_fee` of
+    /// the stablecoin left, the owner gets the rest, and the escrow closes.
+    pub fn settle_invest(mut ctx: Context<SettleInvest>, fee: u64) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let a = &mut ctx.accounts;
+        require!(a.order.filled == ALL_LEGS, PfErr::LegNotFilled);
+        require!(fee <= a.order.max_fee, PfErr::FeeAboveMax);
+        let streamed = settle_fees(&mut a.vault, a.unit_mint.supply, now)?;
+        let holdings = [a.vault_leg0.amount, a.vault_leg1.amount, a.vault_leg2.amount, a.vault_leg3.amount];
+        let supply = a.unit_mint.supply.checked_add(streamed).ok_or(PfErr::Overflow)?;
+        let bought = [a.order_leg0.amount, a.order_leg1.amount, a.order_leg2.amount, a.order_leg3.amount];
+        let mut v = pf::Vault::new(holdings.map(u128::from), supply as u128);
+        v.entry_bp = a.vault.entry_bp as u128;
+        let out = pf::deposit(&mut v, bought.map(u128::from)).map_err(core_err)?;
+        let after = (supply as u128).checked_add(out.gross).ok_or(PfErr::Overflow)?;
+        require!(after <= a.vault.cap as u128, PfErr::CapExceeded);
+        let units = u64::try_from(out.to_depositor).map_err(|_| PfErr::Overflow)?;
+        require!(units >= a.order.min_units, PfErr::SlippageUnits);
+        let entry_fee = u64::try_from(out.to_creator).map_err(|_| PfErr::Overflow)?;
+
+        let owner = a.order.owner;
+        let id = a.order.id.to_le_bytes();
+        let obump = [a.order.bump];
+        let oseeds: &[&[&[u8]]] = &[&[ORDER_SEED, owner.as_ref(), &id, &obump]];
+        // Everything bought goes in: what the arithmetic needs, plus the leftover
+        // above the binding leg (a fraction of a percent with a good split).
+        let mints = [&a.mint0, &a.mint1, &a.mint2, &a.mint3];
+        let from = [&a.order_leg0, &a.order_leg1, &a.order_leg2, &a.order_leg3];
+        let to = [&a.vault_leg0, &a.vault_leg1, &a.vault_leg2, &a.vault_leg3];
+        for i in 0..4 {
+            xfer(a.token_program.to_account_info(), from[i].to_account_info(), mints[i].to_account_info(),
+                to[i].to_account_info(), a.order.to_account_info(), bought[i], mints[i].decimals, Some(oseeds))?;
+        }
+        ensure_ata(a.associated_token_program.to_account_info(), a.settler.to_account_info(), a.user_unit.to_account_info(),
+            a.owner.to_account_info(), a.unit_mint.to_account_info(), a.system_program.to_account_info(), a.token_program.to_account_info())?;
+        let vbump = [a.vault.vault_bump];
+        let vseeds: &[&[&[u8]]] = &[&[VAULT_SEED, &vbump]];
+        token_interface::mint_to(
+            CpiContext::new_with_signer(
+                a.token_program.to_account_info(),
+                MintTo { mint: a.unit_mint.to_account_info(), to: a.user_unit.to_account_info(), authority: a.vault.to_account_info() },
+                vseeds,
+            ),
+            units,
+        )?;
+        mint_fees(&a.token_program, &a.unit_mint, &a.fee_account, &a.vault, entry_fee + streamed)?;
+
+        // Stablecoin left: the settler's fee, then the owner's change.
+        let left = a.order_stable.amount;
+        let fee = fee.min(left);
+        xfer(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.stable_mint.to_account_info(),
+            a.fee_to.to_account_info(), a.order.to_account_info(), fee, a.stable_mint.decimals, Some(oseeds))?;
+        let change = left - fee;
+        if change > 0 {
+            ensure_ata(a.associated_token_program.to_account_info(), a.settler.to_account_info(), a.user_stable.to_account_info(),
+                a.owner.to_account_info(), a.stable_mint.to_account_info(), a.system_program.to_account_info(), a.stable_token_program.to_account_info())?;
+            xfer(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.stable_mint.to_account_info(),
+                a.user_stable.to_account_info(), a.order.to_account_info(), change, a.stable_mint.decimals, Some(oseeds))?;
+        }
+        close_escrow_account(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        for acc in from {
+            close_escrow_account(a.token_program.to_account_info(), acc.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        }
+        emit!(Deposited { user: owner, units, taken: bought, supply_after: after as u64 });
+        emit!(OrderSettled { order: a.order.key(), owner, kind: KIND_INVEST, out: units, fee, change });
+        Ok(())
+    }
+
+    /// Finish a redeem order whose legs are all sold: the stablecoin goes to the
+    /// owner less the settler's `fee` ≤ `max_fee`; any sale dust goes to the vault.
+    pub fn settle_redeem(mut ctx: Context<SettleRedeem>, fee: u64) -> Result<()> {
+        let a = &mut ctx.accounts;
+        require!(a.order.filled == ALL_LEGS, PfErr::LegNotFilled);
+        require!(fee <= a.order.max_fee, PfErr::FeeAboveMax);
+        let owner = a.order.owner;
+        let id = a.order.id.to_le_bytes();
+        let obump = [a.order.bump];
+        let oseeds: &[&[&[u8]]] = &[&[ORDER_SEED, owner.as_ref(), &id, &obump]];
+        let total = a.order_stable.amount;
+        let fee = fee.min(total);
+        xfer(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.stable_mint.to_account_info(),
+            a.fee_to.to_account_info(), a.order.to_account_info(), fee, a.stable_mint.decimals, Some(oseeds))?;
+        let payout = total - fee;
+        if payout > 0 {
+            ensure_ata(a.associated_token_program.to_account_info(), a.settler.to_account_info(), a.user_stable.to_account_info(),
+                a.owner.to_account_info(), a.stable_mint.to_account_info(), a.system_program.to_account_info(), a.stable_token_program.to_account_info())?;
+            xfer(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.stable_mint.to_account_info(),
+                a.user_stable.to_account_info(), a.order.to_account_info(), payout, a.stable_mint.decimals, Some(oseeds))?;
+        }
+        let mints = [&a.mint0, &a.mint1, &a.mint2, &a.mint3];
+        let legs = [&a.order_leg0, &a.order_leg1, &a.order_leg2, &a.order_leg3];
+        let vl = [&a.vault_leg0, &a.vault_leg1, &a.vault_leg2, &a.vault_leg3];
+        for i in 0..4 {
+            xfer(a.token_program.to_account_info(), legs[i].to_account_info(), mints[i].to_account_info(),
+                vl[i].to_account_info(), a.order.to_account_info(), legs[i].amount, mints[i].decimals, Some(oseeds))?;
+        }
+        close_escrow_account(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        for acc in legs {
+            close_escrow_account(a.token_program.to_account_info(), acc.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        }
+        emit!(OrderSettled { order: a.order.key(), owner, kind: KIND_REDEEM, out: payout, fee, change: 0 });
+        Ok(())
+    }
+
+    /// Refund an order: the owner at any time, anyone once it has expired.
+    /// Everything the escrow holds goes to the owner; the rent to the payer.
+    pub fn cancel_order(mut ctx: Context<CancelOrder>) -> Result<()> {
+        let now = Clock::get()?.unix_timestamp;
+        let a = &mut ctx.accounts;
+        let owner = a.order.owner;
+        require!(a.canceller.key() == owner || now >= a.order.expires_at, PfErr::OrderNotExpired);
+        let id = a.order.id.to_le_bytes();
+        let obump = [a.order.bump];
+        let oseeds: &[&[&[u8]]] = &[&[ORDER_SEED, owner.as_ref(), &id, &obump]];
+        let stable = a.order_stable.amount;
+        if stable > 0 {
+            ensure_ata(a.associated_token_program.to_account_info(), a.canceller.to_account_info(), a.user_stable.to_account_info(),
+                a.owner.to_account_info(), a.stable_mint.to_account_info(), a.system_program.to_account_info(), a.stable_token_program.to_account_info())?;
+            xfer(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.stable_mint.to_account_info(),
+                a.user_stable.to_account_info(), a.order.to_account_info(), stable, a.stable_mint.decimals, Some(oseeds))?;
+        }
+        let mints = [&a.mint0, &a.mint1, &a.mint2, &a.mint3];
+        let legs = [&a.order_leg0, &a.order_leg1, &a.order_leg2, &a.order_leg3];
+        let ul = [&a.user_leg0, &a.user_leg1, &a.user_leg2, &a.user_leg3];
+        let mut returned = [0u64; 4];
+        for i in 0..4 {
+            returned[i] = legs[i].amount;
+            if returned[i] > 0 {
+                ensure_ata(a.associated_token_program.to_account_info(), a.canceller.to_account_info(), ul[i].to_account_info(),
+                    a.owner.to_account_info(), mints[i].to_account_info(), a.system_program.to_account_info(), a.token_program.to_account_info())?;
+                xfer(a.token_program.to_account_info(), legs[i].to_account_info(), mints[i].to_account_info(),
+                    ul[i].to_account_info(), a.order.to_account_info(), returned[i], mints[i].decimals, Some(oseeds))?;
+            }
+        }
+        close_escrow_account(a.stable_token_program.to_account_info(), a.order_stable.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        for acc in legs {
+            close_escrow_account(a.token_program.to_account_info(), acc.to_account_info(), a.payer.to_account_info(), a.order.to_account_info(), oseeds)?;
+        }
+        emit!(OrderCancelled { order: a.order.key(), owner, stable_returned: stable, legs_returned: returned });
+        Ok(())
+    }
 }
 
 // ------------------------------------------------------------------- helpers
@@ -1498,6 +1810,38 @@ pub struct PositionClaimed {
 }
 
 #[event]
+pub struct OrderOpened {
+    pub order: Pubkey,
+    pub owner: Pubkey,
+    pub kind: u8,
+    pub amount_in: u64,
+    pub expires_at: i64,
+}
+#[event]
+pub struct LegFilled {
+    pub order: Pubkey,
+    pub leg: u8,
+    pub spent: u64,
+    pub got: u64,
+}
+#[event]
+pub struct OrderSettled {
+    pub order: Pubkey,
+    pub owner: Pubkey,
+    pub kind: u8,
+    pub out: u64,
+    pub fee: u64,
+    pub change: u64,
+}
+#[event]
+pub struct OrderCancelled {
+    pub order: Pubkey,
+    pub owner: Pubkey,
+    pub stable_returned: u64,
+    pub legs_returned: [u64; 4],
+}
+
+#[event]
 pub struct PositionExited {
     pub id: u64,
     pub owner: Pubkey,
@@ -1567,4 +1911,33 @@ pub enum PfErr {
     FeeTooHigh,
     #[msg("fees can only go to FEE_OWNER's PAIF account")]
     BadFeeAccount,
+    // ---- v4 (appended)
+    #[msg("orders are paid in USDC or USDT only")]
+    BadStableMint,
+    #[msg("order must last at least a minute and at most an hour")]
+    BadExpiry,
+    #[msg("every leg needs a budget, and budgets plus the fee cap must fit the amount")]
+    BadBudget,
+    #[msg("leg must be 0 to 3")]
+    BadLeg,
+    #[msg("order has expired: cancel it for a refund")]
+    OrderExpired,
+    #[msg("only the owner may cancel before the order expires")]
+    OrderNotExpired,
+    #[msg("this leg is already filled")]
+    LegAlreadyFilled,
+    #[msg("not every leg is filled yet")]
+    LegNotFilled,
+    #[msg("the swap spent more than this leg's budget")]
+    BudgetExceeded,
+    #[msg("the swap delivered less than this leg's minimum")]
+    FillBelowMinimum,
+    #[msg("the swap took from an escrow account it had no business touching")]
+    OrderDrained,
+    #[msg("fills may only call the swap program fixed in code")]
+    NotSwapProgram,
+    #[msg("fee above the order's fee cap")]
+    FeeAboveMax,
+    #[msg("wrong kind of order for this instruction")]
+    BadOrderKind,
 }

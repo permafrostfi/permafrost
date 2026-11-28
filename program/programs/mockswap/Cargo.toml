@@ -1,0 +1,21 @@
+[package]
+name = "mockswap"
+version = "0.1.0"
+edition = "2021"
+description = "TEST ONLY: a stand-in for Jupiter in LiteSVM. Never deployed to mainnet."
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "mockswap"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "=0.31.3"
+anchor-spl = { version = "=0.31.3", default-features = false, features = ["token", "token_2022", "associated_token"] }
