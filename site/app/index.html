@@ -228,6 +228,10 @@ import { makeRouter, STABLES } from '../js/router.js';
 const RPC_URL = '/api/rpc';
 const rpc = new Rpc(RPC_URL);
 let addresses = null, router = null, relayInfo = null;
+/* v4 (28 Nov): one signature per action, through /api/order. On until
+   addresses.json says `orders: true` (set when the v4 program is live), the page
+   uses the two-step flow. */
+let orders = false, orderPolicy = null;
 let wallet = null, fund = null, holder = null, priced = null, loadError = '';
 let route = 'home', amount = '', wAmt = '', coin = 'USDC', wCoin = 'USDC';
 let busy = false, built = null, statusHtml = '', statusCls = '';
@@ -287,12 +291,19 @@ async function load() {
       throw new Error('bad addresses');
     }
   } catch { loadError = 'notlive'; render(); return; }
-  try {
-    relayInfo = await (await fetch('/api/relay')).json();
-    router = makeRouter({ web3: window.solanaWeb3, rpc: RPC_URL, addresses, relayer: relayInfo.relayer });
-  } catch { loadError = 'relay'; }
+  if (addresses.orders) {
+    try {
+      const r = await (await fetch('/api/order', { cache: 'no-store' })).json();
+      if (r && r.policy && r.relayer) { orders = true; orderPolicy = r.policy; relayInfo = { relayer: r.relayer }; }
+    } catch { /* fall back to the two-step flow */ }
+  }
+  if (!orders) {
+    try { relayInfo = await (await fetch('/api/relay')).json(); } catch { loadError = 'relay'; }
+  }
+  if (relayInfo && relayInfo.relayer) router = makeRouter({ web3: window.solanaWeb3, rpc: RPC_URL, addresses, relayer: relayInfo.relayer });
   await refresh();
 }
+const feeStable = () => (orderPolicy ? BigInt(Math.round(orderPolicy.feeUsd * 1e6)) : 0n);
 
 async function refresh() {
   try {
@@ -348,7 +359,17 @@ function disconnect() {
 async function review(kind) {
   built = null; statusCls = ''; statusHtml = ''; busy = true; render();
   try {
-    if (kind === 'invest') {
+    if (kind === 'invest' && orders) {
+      const amt = toBase(amount, STABLES[coin].decimals);
+      if (amt < 5_000_000n) throw new Error('the minimum is 5 ' + coin.toLowerCase() + '.');
+      built = await router.buildOrderInvest({ user: wallet.toBase58(), stable: coin, amount: amt, feeStable: feeStable() });
+      built.args = { coin, amount: amt }; built.one = true;
+    } else if (kind === 'withdraw' && orders) {
+      const units = toBase(wAmt, 9);
+      if (units === 0n || !holder || units > holder.rawUnits) throw new Error('enter an amount up to the units you hold.');
+      built = await router.buildOrderRedeem({ user: wallet.toBase58(), stable: wCoin, units, feeStable: feeStable() });
+      built.args = { coin: wCoin, units }; built.one = true;
+    } else if (kind === 'invest') {
       const amt = toBase(amount, STABLES[coin].decimals);
       if (amt < 5_000_000n) throw new Error('the minimum is 5 ' + coin.toLowerCase() + '.');
       built = await router.buildInvest({
@@ -406,8 +427,62 @@ const declined = (e) => /reject|declin/i.test(e?.message || '');
    and the deposit (or the sales) can't be checked until the swaps (or the
    redemption) have landed. So: step 1, then step 2 built from what arrived.
    Each step is rebuilt when it is signed, so its prices are fresh. */
+/* v4: one signature → /api/order → the gas service fills and settles while the
+   page asks it to keep going. Rebuilt at signing so the quotes are fresh. */
+async function signOrder() {
+  const kind = built.kind, args = built.args;
+  const user = wallet.toBase58();
+  busy = true; statusCls = '';
+  const say = (t) => { statusHtml = t; render(); };
+  let orderKey = null;
+  try {
+    say('getting fresh prices…');
+    const b = kind === 'invest'
+      ? await router.buildOrderInvest({ user, stable: args.coin, amount: args.amount, feeStable: feeStable() })
+      : await router.buildOrderRedeem({ user, stable: args.coin, units: args.units, feeStable: feeStable() });
+    say('approve in phantom…');
+    const signed = await provider().signTransaction(b.txs[0]);
+    say('sending…');
+    const enc = btoa(String.fromCharCode(...signed.serialize()));
+    let r = await (await fetch('/api/order', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ tx: enc }) })).json();
+    if (r.error === 'expired') throw new Error('prices expired before sending (over a minute passed). nothing was sent. press sign again.');
+    if (r.error) throw new Error(r.error);
+    orderKey = r.order;
+    const label = (st) => {
+      const n = [0, 1, 2, 3].filter((i) => (st.filled || 0) & (1 << i)).length;
+      return kind === 'invest' ? `buying the four stocks… ${n} of 4 done` : `selling the four stocks… ${n} of 4 done`;
+    };
+    say(label(r));
+    const t0 = Date.now();
+    while (r.status !== 'settled' && r.status !== 'cancelled' && r.status !== 'closed') {
+      if (Date.now() - t0 > 12 * 60_000) throw new Error('taking too long; the order refunds itself after 10 minutes.');
+      await new Promise((ok) => setTimeout(ok, 2500));
+      r = await (await fetch('/api/order', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ step: orderKey }) })).json();
+      if (r.error) throw new Error(r.error);
+      say(r.filled === 15 || (r.events || []).some((e) => e.settle) ? (kind === 'invest' ? 'adding the stocks to the fund…' : 'sending your ' + args.coin.toLowerCase() + '…') : label(r));
+    }
+    if (r.status === 'cancelled') {
+      statusCls = 'bad';
+      statusHtml = 'the order could not be completed in time and was refunded in full. prices may have moved; please try again.';
+      built = null; busy = false; await refresh(); return;
+    }
+    const sig = (r.events || []).map((e) => e.settle).filter(Boolean).pop();
+    statusCls = 'ok';
+    statusHtml = 'done.' + (sig ? ' <a href="https://solscan.io/tx/' + sig + '" target="_blank" rel="noopener noreferrer">view on solscan</a>' : '');
+    built = null; amount = ''; wAmt = ''; busy = false;
+    await refresh();
+    return;
+  } catch (e) {
+    statusCls = 'bad';
+    statusHtml = declined(e) ? 'you declined in phantom. nothing was sent.' : esc(e.message || e)
+      + (orderKey ? '<br>your order is still open: it completes on its own, or refunds itself after 10 minutes. reload to check.' : '');
+  }
+  busy = false; render();
+}
+
 async function sign() {
   if (!built) return;
+  if (built.one) return signOrder();
   const kind = built.kind, args = built.args;
   const user = wallet.toBase58();
   busy = true; statusCls = '';
@@ -567,6 +642,23 @@ function investPane() {
     return '<div class="pick"><h3 class="lead">connect phantom to invest</h3>'
       + btn('connect phantom', ' data-connect') + '</div>' + statusBlock();
   }
+  if (built && built.kind === 'invest' && built.one) {
+    const s = built.summary;
+    const atLeast = Number(s.minUnits) / 1e9, about = Number(s.unitsExpected) / 1e9;
+    return connBar()
+      + '<div class="est">'
+      + '<div class="r"><span>you pay</span><span>' + num(Number(s.amount) / 1e6, 2) + ' ' + coin.toLowerCase() + '</span></div>'
+      + '<div class="r"><span>network fees</span><span>' + (s.fee === 0n ? 'free (first ' + (orderPolicy ? orderPolicy.subsidyWallets : 50) + ' wallets)' : '&minus;' + num(Number(s.fee) / 1e6, 2)) + '</span></div>'
+      + '<div class="r"><span>buys the four stocks</span><span>' + num(Number(s.spend) / 1e6, 2) + '</span></div>'
+      + '<div class="r key"><span>you receive about</span><span>' + num(about, 4) + ' units</span></div>'
+      + '<div class="r"><span>at least</span><span>' + num(atLeast, 4) + ' units, or a full refund</span></div>'
+      + (priced && priced.priced ? '<div class="r"><span>worth about</span><span>' + usd(about * priced.navPerUnit) + '</span></div>' : '')
+      + '</div>'
+      + '<p class="fn">one approval in phantom. the fund buys the stocks itself; done in about half a minute.</p>'
+      + '<div class="go">' + btn(busy ? 'working…' : 'sign in phantom', busy ? ' disabled' : ' data-sign') + '</div>'
+      + '<button class="back" data-cancel>&larr; change the amount</button>'
+      + statusBlock();
+  }
   if (built && built.kind === 'invest') {
     const s = built.summary;
     const units = Number(s.minUnitsOut) / 1e9;
@@ -602,6 +694,20 @@ function withdrawPane() {
     return '<div class="pick"><h3 class="lead">connect phantom to see the value of '
       + 'your units &amp; withdraw</h3>'
       + btn('connect phantom', ' data-connect') + '</div>' + statusBlock();
+  }
+  if (built && built.kind === 'withdraw' && built.one) {
+    const s = built.summary;
+    return connBar()
+      + '<div class="est">'
+      + '<div class="r"><span>you hand back</span><span>' + num(wAmt || 0, 4) + ' units</span></div>'
+      + '<div class="r"><span>network fees</span><span>' + (s.fee === 0n ? 'free' : '&minus;' + num(Number(s.fee) / 1e6, 2)) + '</span></div>'
+      + '<div class="r key"><span>you receive about</span><span>' + num(Number(s.net) / 1e6, 2) + ' ' + wCoin.toLowerCase() + '</span></div>'
+      + '<div class="r unk"><span>cost of these units</span><span>unknown</span></div>'
+      + '<div class="r unk"><span>return on this withdrawal</span><span>unknown</span></div>'
+      + '<p class="fn">one approval in phantom. the fund sells the stocks itself and sends you ' + wCoin.toLowerCase() + '; each sale is protected against price moves of more than 1%.</p></div>'
+      + '<div class="go">' + btn(busy ? 'working…' : 'sign in phantom', busy ? ' disabled' : ' data-sign') + '</div>'
+      + '<button class="back" data-cancel>&larr; change the amount</button>'
+      + statusBlock();
   }
   if (built && built.kind === 'withdraw') {
     const s = built.summary;

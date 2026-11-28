@@ -31,7 +31,13 @@ export const DISC = {
   deposit_locked: [88, 91, 135, 52, 79, 190, 164, 141],
   claim_locked: [34, 206, 181, 23, 11, 207, 147, 90],
   exit_locked: [207, 93, 52, 157, 105, 252, 90, 187],
+  // v4 orders (28 Nov)
+  order_invest: [185, 129, 130, 118, 24, 64, 154, 221],
+  order_redeem: [223, 244, 191, 69, 48, 105, 196, 143],
+  cancel_order: [95, 129, 237, 240, 8, 49, 223, 132],
 };
+/* An order must live 1–60 minutes on chain; the site gives fills 10 minutes. */
+export const ORDER_LIFE_SECONDS = 600;
 /* Account sizes the router creates. Their rent is read from the cluster at build
  * time (getMinimumBalanceForRentExemption), never hard-coded: on 26 Nov the live
  * rate was ~27% below the long-standing figure (179 B = 1,559,560 lamports, not
@@ -486,5 +492,105 @@ export function makeRouter({ web3, rpc, addresses, relayer, jupiter = 'https://l
     return { txs: [await compile(user, ixs, [], blockhash)] };
   }
 
-  return { buildInvest, buildDeposit, buildRedeem, buildSell, buildSettle, walletLegs, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64, positionPda };
+  /* ============================================================ v4 orders
+   * One user signature. The gas service (fee payer AND rent payer, account 1)
+   * co-signs, sends, fills through Jupiter and settles. The user signs the whole
+   * plan: per leg the most stablecoin to spend and the least stock to accept
+   * (from live quotes, 1% slippage), the fewest units overall, the fee cap. */
+  const orderPda = (user, id) => W.PublicKey.findProgramAddressSync([enc.encode('order'), user.toBuffer(), u64le(id)], PK(addresses.programId))[0];
+  const randomId = () => { const b = new Uint8Array(8); crypto.getRandomValues(b); b[7] &= 0x7f; return new DataView(b.buffer).getBigUint64(0, true); };
+  const i64le = (v) => { const b = new Uint8Array(8); new DataView(b.buffer).setBigInt64(0, BigInt(v), true); return b; };
+
+  /* feeStable: the gas service's fee cap in the stablecoin's base units (0 while subsidised). */
+  async function buildOrderInvest({ user: userStr, stable: stableName, amount, feeStable = 0n, slippageBps = 100 }) {
+    const user = PK(userStr);
+    const stable = STABLES[stableName];
+    if (!stable) throw new Error('stable must be USDC or USDT');
+    const f = await fund();
+    const [, ...legUsd] = await prices([SOL_MINT, ...A.legMints.map((m) => m.toBase58())]);
+    const total = BigInt(amount);
+    const fee = BigInt(feeStable);
+    const spend = total - fee;
+    if (spend <= 0n) throw new Error('amount too small');
+    // Split by the vault's current weights, so the four legs land in proportion
+    // (the leftover above the binding leg stays in the vault).
+    const values = f.holdings.map((h, i) => (Number(h) / 1e8) * legUsd[i]);
+    const sum = values.reduce((a, b) => a + b, 0);
+    const budget = values.map((v) => BigInt(Math.floor(Number(spend) * (v / sum))));
+    const quotes = await Promise.all(budget.map((b, i) => quote(stable.mint, A.legMints[i].toBase58(), b.toString())));
+    const minOut = quotes.map((q) => (BigInt(q.otherAmountThreshold) * BigInt(10000 - slippageBps)) / 10000n);
+    // Units the vault's arithmetic would mint for exactly minOut of each leg (the binding leg decides), less 1%.
+    let k = null;
+    for (let i = 0; i < 4; i++) { const r = (minOut[i] * 10n ** 18n) / f.holdings[i]; if (k === null || r < k) k = r; }
+    const unitsMin = (k * f.supply) / 10n ** 18n;
+    const minUnits = (unitsMin * 9900n) / 10000n;
+    const expected = quotes.map((q) => BigInt(q.outAmount));
+    let ke = null;
+    for (let i = 0; i < 4; i++) { const r = (expected[i] * 10n ** 18n) / f.holdings[i]; if (ke === null || r < ke) ke = r; }
+    const unitsExpected = (ke * f.supply) / 10n ** 18n;
+    const id = randomId();
+    const expiresAt = Math.floor(Date.now() / 1000) + ORDER_LIFE_SECONDS;
+    const order = orderPda(user, id);
+    const keys = [
+      meta(user, true, false), meta(RELAYER, true, true), meta(order, false, true),
+      meta(PK(stable.mint), false, false), meta(ata(user, PK(stable.mint), P.token), false, true), meta(ata(order, PK(stable.mint), P.token), false, true),
+      ...A.legMints.map((m) => meta(m, false, false)), ...A.legMints.map((m) => meta(ata(order, m, P.token2022), false, true)),
+      meta(P.token, false, false), meta(P.token2022, false, false), meta(P.ata, false, false), meta(P.system, false, false),
+    ];
+    const data = cat(Uint8Array.from(DISC.order_invest), u64le(id), u64le(total), ...budget.map(u64le), ...minOut.map(u64le), u64le(minUnits), u64le(fee), i64le(expiresAt));
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    const tx = await compile(user, [...budget300(), ix(A.program, keys, data)], [], blockhash);
+    return { txs: [tx], order: order.toBase58(), summary: { stable: stableName, amount: total, fee, spend, budget, minOut, minUnits, unitsExpected, expiresAt, id } };
+  }
+
+  async function buildOrderRedeem({ user: userStr, stable: stableName, units, feeStable = 0n, slippageBps = 100 }) {
+    const user = PK(userStr);
+    const stable = STABLES[stableName];
+    if (!stable) throw new Error('stable must be USDC or USDT');
+    const f = await fund();
+    const u = BigInt(units);
+    const burned = u - (u * f.exitBp) / 10000n;
+    const payout = f.holdings.map((h) => (h * burned) / f.supply);
+    const quotes = await Promise.all(payout.map((p, i) => (p > 0n ? quote(A.legMints[i].toBase58(), stable.mint, p.toString()) : null)));
+    const minOut = quotes.map((q) => (q ? (BigInt(q.otherAmountThreshold) * BigInt(10000 - slippageBps)) / 10000n : 0n));
+    const expected = quotes.reduce((a, q) => a + (q ? BigInt(q.outAmount) : 0n), 0n);
+    const fee = BigInt(feeStable);
+    const id = randomId();
+    const expiresAt = Math.floor(Date.now() / 1000) + ORDER_LIFE_SECONDS;
+    const order = orderPda(user, id);
+    const keys = [
+      meta(user, true, false), meta(RELAYER, true, true), meta(order, false, true),
+      meta(A.vault, false, true), meta(A.unitMint, false, true), meta(ata(user, A.unitMint, P.token2022), false, true), meta(A.feeAccount, false, true),
+      meta(PK(stable.mint), false, false), meta(ata(order, PK(stable.mint), P.token), false, true),
+      ...A.legMints.map((m) => meta(m, false, false)), ...A.vaultLegs.map((v) => meta(v, false, true)),
+      ...A.legMints.map((m) => meta(ata(order, m, P.token2022), false, true)),
+      meta(P.token, false, false), meta(P.token2022, false, false), meta(P.ata, false, false), meta(P.system, false, false),
+    ];
+    const data = cat(Uint8Array.from(DISC.order_redeem), u64le(id), u64le(u), ...minOut.map(u64le), u64le(fee), i64le(expiresAt));
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    const tx = await compile(user, [...budget300(), ix(A.program, keys, data)], [], blockhash);
+    return { txs: [tx], order: order.toBase58(), summary: { stable: stableName, units: u, payout, minOut, expected, fee, net: expected - fee, expiresAt, id } };
+  }
+
+  /* The owner's own cancel (any time): refund of whatever the escrow holds. */
+  async function buildCancelOrder({ user: userStr, order: orderStr, stable: stableName }) {
+    const user = PK(userStr);
+    const order = PK(orderStr);
+    const stable = STABLES[stableName];
+    const keys = [
+      meta(user, true, true), meta(order, false, true), meta(user, false, false), meta(RELAYER, false, true),
+      meta(PK(stable.mint), false, false), meta(ata(order, PK(stable.mint), P.token), false, true), meta(ata(user, PK(stable.mint), P.token), false, true),
+      ...A.legMints.map((m) => meta(m, false, false)), ...A.legMints.map((m) => meta(ata(order, m, P.token2022), false, true)),
+      ...A.legMints.map((m) => meta(ata(user, m, P.token2022), false, true)),
+      meta(P.token, false, false), meta(P.token2022, false, false), meta(P.ata, false, false), meta(P.system, false, false),
+    ];
+    const blockhash = (await call('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+    return { txs: [await compile(user, [...budget300(), ix(A.program, keys, Uint8Array.from(DISC.cancel_order))], [], blockhash)] };
+  }
+  const budget300 = () => [
+    ix(P.computeBudget, [], cat(Uint8Array.from([2]), u32le(300_000))),
+    ix(P.computeBudget, [], cat(Uint8Array.from([3]), u64le(GAS.microLamportsPerCu))),
+  ];
+
+  return { buildInvest, buildDeposit, buildRedeem, buildSell, buildSettle, buildOrderInvest, buildOrderRedeem, buildCancelOrder, orderPda, walletLegs, fund, prices, ata, A, P, RELAYER, txCost, toStable, b64, positionPda };
 }
