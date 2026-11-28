@@ -466,8 +466,7 @@ function investPane() {
       + '<div class="r key"><span>you receive at least</span><span>' + num(units, 4) + ' units</span></div>'
       + (priced && priced.priced
         ? '<div class="r"><span>worth about</span><span>' + usd(units * priced.navPerUnit) + '</span></div>' : '')
-      + '<p class="fn">the account cost is mostly one-time. tiny amounts of the stock '
-      + 'tokens may be left in your wallet.</p></div>'
+      + '</div>'
       + '<div class="go">' + btn(busy ? 'working…' : 'sign in phantom', busy ? ' disabled' : ' data-sign') + '</div>'
       + '<button class="back" data-cancel>&larr; change the amount</button>'
       + statusBlock();
