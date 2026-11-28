@@ -42,6 +42,16 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-t
 .frame b:nth-child(3){bottom:0;left:0;border-right:0;border-top:0}
 .frame b:nth-child(4){bottom:0;right:0;border-left:0;border-top:0}
 
+.wbar{position:fixed;top:clamp(26px,3.4vw,48px);right:clamp(40px,4.2vw,58px);z-index:5;
+  display:flex;align-items:center;gap:11px;background:var(--paper);
+  border:2px solid var(--ice);padding:7px 12px;font-size:.8rem;font-weight:600;
+  letter-spacing:.02em}
+.wbar:empty{display:none}
+.wbar em{width:8px;height:8px;background:var(--ice);font-style:normal;flex:none}
+.wbar button{font-size:.72rem;font-weight:200;color:var(--ink-2);text-decoration:underline}
+.wbar button:hover{color:var(--ice)}
+@media (max-width:860px){.wbar{position:static;margin:0 0 18px;align-self:flex-start}}
+
 .shell{position:relative;z-index:2;min-height:100svh;display:grid;
   grid-template-columns:minmax(300px,30rem) 1fr;grid-template-rows:auto 1fr;
   grid-template-areas:"mark right" "left right";gap:0 clamp(12px,3vw,44px);
@@ -186,6 +196,7 @@ button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;text-t
 <body>
 <div class="sky" id="sky" aria-hidden="true"><canvas id="skyc"></canvas></div>
 <div class="frame" aria-hidden="true"><b></b><b></b><b></b><b></b></div>
+<div class="wbar" id="wbar"></div>
 
 <div class="shell" id="shell">
   <header class="mark">
@@ -513,7 +524,9 @@ function statsBlock() {
       + '<b>not live yet</b></div><p class="stnote">the fund launches shortly</p></div>';
   }
   let rows;
-  if (wallet && holder) {
+  /* The front page is the fund's, not the holder's: the wallet's own figures
+     belong on invest and withdraw. */
+  if (wallet && holder && route !== 'home') {
     rows = [
       ['your units', num(holder.units, 4), 0],
       ['worth', priced && priced.priced ? usd(holder.units * priced.navPerUnit) : '—', 1],
@@ -526,7 +539,7 @@ function statsBlock() {
       ['unit value', priced && priced.priced ? usd(priced.navPerUnit) : '—', 1],
     ];
   }
-  const note = (wallet && holder) ? ''
+  const note = (wallet && holder && route !== 'home') ? ''
     : (fund.warnings && fund.warnings.length ? esc(fund.warnings.join(' · ')) : 'read live from solana');
   return '<div class="stats">'
     + rows.map((g) => '<div class="st"><span class="lb2">' + g[0] + '</span><b'
@@ -644,7 +657,7 @@ function render() {
       const soon = SOON.indexOf(r) >= 0;
       return '<div>' + btn(r, soon ? ' disabled aria-disabled="true"' : ' data-go="' + r + '"')
         + '<p class="nar">' + NAV_NAR[r] + (soon ? ' (coming soon)' : '') + '</p></div>';
-    }).join('') + '</nav>' + foot;
+    }).join('') + '</nav>' + holdsList() + foot;
     Rt.className = 'right mid';
     Rt.innerHTML = statsBlock();
   } else {
@@ -652,6 +665,11 @@ function render() {
     Rt.className = 'right mid';
     Rt.innerHTML = statsBlock();
   }
+  const wb = document.getElementById('wbar');
+  wb.innerHTML = (route === 'home' && wallet)
+    ? '<em></em><span>' + esc(shortAddr(wallet.toBase58())) + '</span>'
+      + '<button data-disc>disconnect</button>'
+    : '';
   wire();
   alignStats();
 }
