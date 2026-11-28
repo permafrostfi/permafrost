@@ -139,7 +139,15 @@ export default async function handler(req, res) {
       if (/expired blockhash|blockhash not found/i.test(String(e.message))) {
         return res.status(409).json({ error: 'expired', message: 'The prices expired before sending (over a minute passed). Nothing was sent.' });
       }
-      throw e;
+      // Jito refuses bundles that write-lock a vote account; some Jupiter routes
+      // (they vary minute to minute) do. Each transaction stands alone (each repays
+      // its own gas), so send them straight to the network instead, one by one.
+      if (/vote account/i.test(String(e.message))) {
+        for (const b64 of encoded) await rpc('sendTransaction', [b64, { encoding: 'base64', preflightCommitment: 'confirmed', maxRetries: 5 }]);
+        bundleId = 'direct';
+      } else {
+        throw e;
+      }
     }
     const signatures = txs.map((t) => bs58.encode(Buffer.from(t.signatures[0])));
     return res.status(200).json({ bundleId, signatures, ...result });
